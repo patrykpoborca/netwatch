@@ -1,0 +1,16 @@
+# netwatch-windows requirements
+#
+# v1 is STDLIB-ONLY. No third-party packages are required to run the watchdog,
+# write JSONL samples, capture snapshots, or push to the Raspberry Pi collector
+# (HTTP push uses the stdlib urllib).
+#
+# Requires: Python 3.11+ on Windows 10/11, run as Administrator for full capture.
+#
+# ----------------------------------------------------------------------------
+# OPTIONAL dependencies (only needed for richer packet-capture parsing).
+# The app degrades gracefully if these are absent (see netwatch/pktparse.py).
+# Install with:  pip install -r requirements.txt   (uncomment as needed)
+# ----------------------------------------------------------------------------
+
+# scapy>=2.5.0        # optional: parse pktmon_capture.pcapng for storm heuristics
+# pyshark>=0.6        # optional: alternative parser (requires Wireshark/tshark installed)

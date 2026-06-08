@@ -1,0 +1,41 @@
+{
+  "host_label": "gaming-desktop",
+  "preferred_interface_alias": "Ethernet",
+  "raspberry_pi_ip": "192.168.4.25",
+  "gateway_ip_override": null,
+  "poll_interval_seconds": 5,
+  "failure_threshold_count": 3,
+  "event_cooldown_seconds": 300,
+  "packet_capture_seconds": 60,
+  "output_dir": "C:\\NetworkSnapshots",
+  "jsonl_log_path": "C:\\NetworkSnapshots\\netwatch-windows.jsonl",
+  "targets": {
+    "internet_ips": ["1.1.1.1", "8.8.8.8"],
+    "dns_names": ["google.com", "cloudflare.com"]
+  },
+  "enable_pktmon_capture": true,
+  "enable_netsh_trace_fallback": true,
+  "repair_enabled": false,
+
+  "log_management": {
+    "max_jsonl_mb": 50,
+    "max_rotated_jsonl_files": 5,
+    "gzip_rotated_jsonl": true,
+    "max_event_folders": 50,
+    "max_event_age_days": 30,
+    "auto_zip_event_folders": true,
+    "hard_cap_event_items": 200,
+    "prune_interval_seconds": 3600
+  },
+
+  "collector": {
+    "enabled": false,
+    "base_url": "http://192.168.4.25:8787",
+    "auth_token": null,
+    "push_samples": true,
+    "push_events": true,
+    "timeout_seconds": 3,
+    "sample_batch_size": 10,
+    "max_push_event_mb": 5
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "host_label": "raspberry-pi-wifi",
+  "preferred_interface": "wlan0",
+  "windows_desktop_ip": "192.168.4.50",
+  "gateway_ip_override": null,
+  "poll_interval_seconds": 5,
+  "failure_threshold_count": 3,
+  "event_cooldown_seconds": 300,
+  "packet_capture_seconds": 60,
+  "output_dir": "/var/log/netwatch-pi",
+  "jsonl_log_path": "/var/log/netwatch-pi/netwatch-pi.jsonl",
+  "targets": {
+    "internet_ips": [
+      "1.1.1.1",
+      "8.8.8.8"
+    ],
+    "dns_names": [
+      "google.com",
+      "cloudflare.com"
+    ]
+  },
+  "enable_tcpdump_capture": true,
+  "log_management": {
+    "max_jsonl_mb": 50,
+    "max_rotated_jsonl_files": 5,
+    "max_event_folders": 50,
+    "max_event_age_days": 30,
+    "prune_interval_seconds": 3600
+  },
+  "collector": {
+    "enabled": true,
+    "bind_host": "0.0.0.0",
+    "bind_port": 8787,
+    "auth_token": null,
+    "incoming_dir": "/var/log/netwatch-pi/incoming",
+    "max_incoming_mb": 500
+  }
+}

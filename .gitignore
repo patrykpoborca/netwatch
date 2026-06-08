@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Local runtime config (copy from the sample config.json and edit locally)
+**/config.local.json
+
+# Watchdog runtime output — never commit captured logs / packet traces / events
+# (these hold local IPs, MACs, DNS queries, hostnames — see runbook privacy notes)
+NetworkSnapshots/
+netwatch-*.jsonl
+netwatch-*.jsonl.*.gz
+events/
+incoming/
+*.pcap
+*.pcapng
+*.etl
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

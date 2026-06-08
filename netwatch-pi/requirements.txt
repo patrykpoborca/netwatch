@@ -1,0 +1,19 @@
+# netwatch-pi dependencies
+#
+# CORE: none. netwatch-pi is intentionally STDLIB-ONLY for v1.
+#   The watchdog, all 8 health checks, JSONL rotation/retention, the systemd
+#   integration, and the HTTP log-collection host use only the Python 3.11+
+#   standard library (http.server, socketserver, json, gzip, zipfile, etc.).
+#   This keeps the SD-card footprint tiny and avoids pip on an offline Pi.
+#
+# The actual diagnostics rely on these SYSTEM packages (install via apt, not pip):
+#   iproute2 dnsutils tcpdump wireless-tools iw network-manager
+#   sudo apt install -y python3 python3-venv python3-pip \
+#       iproute2 dnsutils tcpdump wireless-tools iw network-manager
+#
+# OPTIONAL (not required for v1): richer packet-capture parsing.
+#   If present, netwatch/pktparse.py will summarize tcpdump pcaps
+#   (broadcast/multicast/ARP/DHCP/DNS/mDNS/SSDP counts, top MACs/IPs).
+#   Absence is handled gracefully via try/except import.
+#
+# scapy>=2.5.0   ; optional — uncomment to enable Python packet parsing

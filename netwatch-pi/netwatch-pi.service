@@ -1,0 +1,17 @@
+[Unit]
+Description=Network Watchdog for Raspberry Pi Wi-Fi Vantage Point
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs the watchdog AND the HTTP log-collection host together (--serve).
+# Drop "--serve" if you do not want the collector endpoint exposed.
+ExecStart=/usr/bin/python3 /opt/netwatch-pi/netwatch_pi.py run --serve --config /etc/netwatch-pi/config.json
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
