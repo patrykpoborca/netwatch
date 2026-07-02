@@ -53,6 +53,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import zipfile
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,6 +76,46 @@ SAMPLE_TAIL_MAX = 5000
 # Chunk size used when streaming file/zip responses to avoid buffering
 # multi-MB event archives entirely in memory.
 STREAM_CHUNK_BYTES = 64 * 1024
+# Wall-clock deadline for reading a full request body. The per-connection socket
+# timeout is only a per-recv IDLE timeout — a slowloris that trickles a byte every
+# <timeout seconds keeps it from ever firing while the handler thread blocks
+# waiting for the declared Content-Length. This total deadline bounds how long any
+# one request can hold a ThreadingHTTPServer thread regardless of trickle rate.
+MAX_BODY_READ_SECONDS = 30
+
+
+def _read_body_bounded(
+    rfile,
+    length: int,
+    max_bytes: int,
+    deadline_seconds: float,
+    now=time.monotonic,
+) -> Optional[bytes]:
+    """Read exactly ``length`` bytes from ``rfile`` under a total wall-clock deadline.
+
+    Returns the body on success, or ``None`` if the declared length is invalid /
+    over ``max_bytes``, the client closes early, or the total read exceeds
+    ``deadline_seconds`` (a slow-trickle / slowloris sender). Reads in chunks via
+    ``read1`` so the deadline is re-checked after every recv rather than blocking
+    for the whole body in one call.
+    """
+    if length < 0 or length > max_bytes:
+        return None
+    if not length:
+        return b""
+    deadline = now() + deadline_seconds
+    chunks: List[bytes] = []
+    remaining = length
+    while remaining > 0:
+        if now() > deadline:
+            return None
+        chunk = rfile.read1(min(remaining, STREAM_CHUNK_BYTES))
+        if not chunk:
+            break  # client closed the connection before sending the full body
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    body = b"".join(chunks)
+    return body if len(body) == length else None
 
 
 def _sanitize_label(value: Optional[str], fallback: str = "unknown-host") -> str:
@@ -549,9 +590,11 @@ def make_handler(server_logic: CollectorServer):
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 return None
-            if length < 0 or length > max_bytes:
-                return None
-            return self.rfile.read(length) if length else b""
+            # Bounded, deadline-enforced read: the per-socket idle timeout alone
+            # does not stop a slow-trickle sender from pinning this thread.
+            return _read_body_bounded(
+                self.rfile, length, max_bytes, MAX_BODY_READ_SECONDS
+            )
 
         # --- routing ---
         def do_GET(self):  # noqa: N802

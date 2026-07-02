@@ -21,8 +21,51 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from netwatch import collector as collector_mod  # noqa: E402
-from netwatch.collector import CollectorServer, _sanitize_label  # noqa: E402
+from netwatch.collector import (  # noqa: E402
+    CollectorServer,
+    _read_body_bounded,
+    _sanitize_label,
+)
 from netwatch.config import Config, default_config_dict  # noqa: E402
+
+
+class _TricklingReader:
+    """Fake rfile whose read1 returns a bounded chunk per call (simulates trickle)."""
+
+    def __init__(self, total: bytes, per_call: int):
+        self._buf = total
+        self._per_call = per_call
+        self.calls = 0
+
+    def read1(self, n):
+        self.calls += 1
+        take = min(n, self._per_call, len(self._buf))
+        chunk, self._buf = self._buf[:take], self._buf[take:]
+        return chunk
+
+
+class TestReadBodyBounded(unittest.TestCase):
+    def test_happy_path_reads_full_body(self):
+        r = _TricklingReader(b"hello world", per_call=4)
+        self.assertEqual(_read_body_bounded(r, 11, 1024, 30), b"hello world")
+
+    def test_zero_length_returns_empty(self):
+        self.assertEqual(_read_body_bounded(_TricklingReader(b"", 1), 0, 1024, 30), b"")
+
+    def test_over_max_rejected(self):
+        self.assertIsNone(_read_body_bounded(_TricklingReader(b"x", 1), 5, 4, 30))
+
+    def test_early_close_returns_none(self):
+        # Reader runs out of bytes before the declared length -> incomplete -> None.
+        self.assertIsNone(_read_body_bounded(_TricklingReader(b"abc", 1), 10, 1024, 30))
+
+    def test_deadline_abort_on_slow_trickle(self):
+        # Fake clock jumps past the deadline: the total-read deadline must abort
+        # even though the reader still has data (slowloris), so the handler thread
+        # is not pinned indefinitely by a byte-per-<timeout> trickle.
+        ticks = iter([0.0, 0.0, 100.0, 200.0, 300.0, 400.0])
+        r = _TricklingReader(b"x" * 1000, per_call=1)
+        self.assertIsNone(_read_body_bounded(r, 1000, 10_000, 30, now=lambda: next(ticks)))
 
 
 class TestSanitizeLabel(unittest.TestCase):
