@@ -148,11 +148,15 @@ class Config:
     # --- sections -----------------------------------------------------------
     @property
     def log_management(self) -> Dict[str, Any]:
-        return self.raw.get("log_management", {})
+        # `or {}` (not just a default): a user can explicitly set this section to
+        # null in config.json, which survives the deep-merge as None. Returning
+        # None here would make every `cfg.log_management.get(...)` call site crash
+        # the watchdog at startup. Mirror the Pi side's defensive handling.
+        return self.raw.get("log_management") or {}
 
     @property
     def collector(self) -> Dict[str, Any]:
-        return self.raw.get("collector", {})
+        return self.raw.get("collector") or {}
 
     # --- derived paths ------------------------------------------------------
     @property

@@ -130,6 +130,27 @@ class TestRunCycleRobustness(unittest.TestCase):
             app._run_prune = orig_prune
 
 
+class TestConfigNullSections(unittest.TestCase):
+    """A config that explicitly nulls log_management/collector must not crash."""
+
+    def test_null_log_management_returns_empty_dict(self):
+        raw = default_config_dict()
+        raw["log_management"] = None  # user set it to null in config.json
+        cfg = Config(raw=raw)
+        self.assertEqual(cfg.log_management, {})
+        # The exact call sites cmd_run uses must not raise.
+        self.assertEqual(cfg.log_management.get("prune_interval_seconds", 3600), 3600)
+
+    def test_null_collector_returns_empty_dict(self):
+        raw = default_config_dict()
+        raw["collector"] = None
+        cfg = Config(raw=raw)
+        self.assertEqual(cfg.collector, {})
+        # Collector(cfg) reads cfg.collector heavily; must construct cleanly.
+        c = Collector(cfg)
+        self.assertFalse(c.enabled)
+
+
 class TestCollectorBatching(unittest.TestCase):
     def _cfg(self):
         raw = default_config_dict()
