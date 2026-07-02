@@ -19,6 +19,25 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 
+def ps_quote(value: object) -> str:
+    """Escape ``value`` for safe embedding inside a single-quoted PowerShell string.
+
+    Every dynamic value the watchdog interpolates into a ``powershell.exe -Command``
+    string (adapter aliases, ping targets, DNS names, gateway IPs, capture file
+    paths) is wrapped in single quotes by the callers. In a single-quoted
+    PowerShell string the ONLY metacharacter is the single quote itself, which is
+    escaped by doubling it. Without this, a value containing ``'`` (e.g. a network
+    adapter named ``foo'; <payload>; '`` installed by a VPN/virtual-adapter driver,
+    or a hostile ``config.json`` field) closes the quoted literal and injects
+    arbitrary PowerShell that runs with the watchdog's privileges (SYSTEM/highest
+    when installed as a scheduled task).
+
+    Returns the escaped inner text WITHOUT the surrounding quotes, so callers keep
+    their existing ``'{...}'`` quoting.
+    """
+    return str(value).replace("'", "''")
+
+
 @dataclass
 class CommandResult:
     """Result of a single external command invocation (never raises)."""

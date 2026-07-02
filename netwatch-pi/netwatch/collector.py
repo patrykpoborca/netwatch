@@ -498,6 +498,14 @@ def make_handler(server_logic: CollectorServer):
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "netwatch-pi/1.0"
+        # Per-connection socket timeout. ThreadingHTTPServer spawns one thread per
+        # connection; without a timeout a client that opens a socket and sends a
+        # large Content-Length (or just stalls) mid-body ties up a handler thread
+        # indefinitely. On an open LAN collector (auth_token unset by default) a
+        # handful of such connections is a trivial thread/resource-exhaustion DoS.
+        # BaseHTTPRequestHandler applies this via socket.settimeout during setup().
+        timeout = 30
+
         # Silence default logging to stderr noise; can be re-enabled if desired.
         def log_message(self, fmt, *args):  # noqa: N802 (stdlib signature)
             pass

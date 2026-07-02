@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from .config import Config
-from .runner import CommandErrorLog, run_cmd, run_powershell
+from .runner import CommandErrorLog, ps_quote, run_cmd, run_powershell
 
 
 def run_repair_actions(
@@ -35,10 +35,11 @@ def run_repair_actions(
     actions.append(f"ipconfig /renew -> {'ok' if r2.ok else 'failed'}")
 
     if alias:
+        q_alias = ps_quote(alias)
         bounce = (
-            f"Disable-NetAdapter -Name '{alias}' -Confirm:$false -ErrorAction SilentlyContinue; "
+            f"Disable-NetAdapter -Name '{q_alias}' -Confirm:$false -ErrorAction SilentlyContinue; "
             "Start-Sleep -Seconds 3; "
-            f"Enable-NetAdapter -Name '{alias}' -Confirm:$false -ErrorAction SilentlyContinue"
+            f"Enable-NetAdapter -Name '{q_alias}' -Confirm:$false -ErrorAction SilentlyContinue"
         )
         r3 = run_powershell(bounce, error_log=error_log, timeout=60, label=f"bounce adapter {alias}")
         actions.append(f"disable/enable adapter '{alias}' -> {'ok' if r3.ok else 'failed'}")
