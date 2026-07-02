@@ -22,25 +22,35 @@ import threading
 import time
 import zipfile
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 
 # --------------------------------------------------------------------------- #
 # Per-path locks, so concurrent appenders (e.g. the collector's threaded HTTP
 # server handling multiple pushes for the same host_label at once) can't race
 # the check-then-rotate-then-append sequence and silently drop/duplicate lines.
+#
+# A bounded pool indexed by a hash of the normalized path is used rather than
+# one lock per distinct path: a per-path dict would grow without bound as new
+# host_labels are pushed (an attacker on an open, unauthenticated LAN
+# collector could push under many unique host_labels purely to grow it), and
+# normalizing the path first ensures two different spellings of the same file
+# (relative vs. absolute, redundant slashes) always map to the same lock.
+# Collisions just mean two unrelated paths occasionally share a lock, which
+# costs a little contention — never correctness — at this device's tiny
+# concurrent-write volume.
 # --------------------------------------------------------------------------- #
-_path_locks: Dict[str, threading.Lock] = {}
-_path_locks_guard = threading.Lock()
+_PATH_LOCK_POOL_SIZE = 64
+_path_lock_pool = [threading.Lock() for _ in range(_PATH_LOCK_POOL_SIZE)]
+# Dedicated lock serializing the incoming-directory retention passes
+# themselves (see ``prune_incoming_events`` / ``enforce_incoming_cap``), since
+# those touch many files/directories at once and must not interleave.
+_retention_lock = threading.Lock()
 
 
 def _lock_for(path: str) -> threading.Lock:
-    with _path_locks_guard:
-        lock = _path_locks.get(path)
-        if lock is None:
-            lock = threading.Lock()
-            _path_locks[path] = lock
-        return lock
+    normalized = os.path.normpath(os.path.abspath(path))
+    return _path_lock_pool[hash(normalized) % _PATH_LOCK_POOL_SIZE]
 
 
 # --------------------------------------------------------------------------- #
@@ -246,44 +256,58 @@ def enforce_incoming_cap(incoming_dir: str, max_mb: int) -> None:
 
     Protects the SD card from unbounded pushed logs. Newest files (most recent
     evidence) are preserved; oldest are removed first.
+
+    Serialized on ``_retention_lock``: the collector's threaded HTTP server
+    can call this (via ``_enforce_incoming_retention``) from multiple request
+    threads at once, and interleaved listing/deletion of the same files could
+    otherwise raise spurious ``OSError``s or race with ``prune_incoming_events``
+    zipping/removing the same folders concurrently.
     """
     if not os.path.isdir(incoming_dir):
         return
-    max_bytes = max_mb * 1024 * 1024
-    if dir_size_bytes(incoming_dir) <= max_bytes:
-        return
-
-    # Collect all files with mtimes, oldest first, and delete until under cap.
-    files: List[str] = []
-    for root, _dirs, names in os.walk(incoming_dir):
-        for n in names:
-            files.append(os.path.join(root, n))
-    files.sort(key=_safe_mtime)
-
-    for f in files:
+    with _retention_lock:
+        max_bytes = max_mb * 1024 * 1024
         if dir_size_bytes(incoming_dir) <= max_bytes:
-            break
-        try:
-            os.remove(f)
-        except OSError:
-            pass
+            return
 
-    _remove_empty_dirs(incoming_dir)
+        # Collect all files with mtimes, oldest first, delete until under cap.
+        files: List[str] = []
+        for root, _dirs, names in os.walk(incoming_dir):
+            for n in names:
+                files.append(os.path.join(root, n))
+        files.sort(key=_safe_mtime)
+
+        for f in files:
+            if dir_size_bytes(incoming_dir) <= max_bytes:
+                break
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+        _remove_empty_dirs(incoming_dir)
 
 
-def _remove_empty_dirs(root_dir: str) -> None:
+def _remove_empty_dirs(root_dir: str, min_age_seconds: float = 10.0) -> None:
     """Remove now-empty subdirectories under (but not including) ``root_dir``.
 
     File-only pruning (as in ``enforce_incoming_cap``) can leave behind empty
     ``<host>/events/<event_id>`` directories once their files are deleted;
     left unchecked these accumulate and can exhaust inodes even while staying
     under the byte cap.
+
+    Directories younger than ``min_age_seconds`` are left alone: an ingest
+    handler ``os.makedirs``'s the event directory and then writes
+    ``summary.json``/``event.zip`` into it as two separate steps, so a
+    concurrent retention pass could otherwise observe it as briefly empty and
+    delete it out from under that in-flight write.
     """
-    for current, dirs, _files in os.walk(root_dir, topdown=False):
+    now = time.time()
+    for current, _dirs, _files in os.walk(root_dir, topdown=False):
         if current == root_dir:
             continue
         try:
-            if not os.listdir(current):
+            if not os.listdir(current) and now - os.path.getmtime(current) > min_age_seconds:
                 os.rmdir(current)
         except OSError:
             pass
@@ -303,24 +327,31 @@ def prune_incoming_events(
     not directories) — an open collector on the LAN could be spammed with
     unique event_ids to grow the directory tree without bound. This mirrors
     the retention already applied to the Pi's own ``events_dir``.
+
+    Serialized on ``_retention_lock``: this is called synchronously after
+    every event ingest on the threaded HTTP server, so concurrent pushes
+    (possibly for different hosts) could otherwise zip/delete the same event
+    folders at the same time, corrupting an in-progress zip or raising
+    spurious errors.
     """
     if not os.path.isdir(incoming_dir):
         return
-    try:
-        hosts = [
-            d for d in os.listdir(incoming_dir)
-            if os.path.isdir(os.path.join(incoming_dir, d))
-        ]
-    except OSError:
-        return
+    with _retention_lock:
+        try:
+            hosts = [
+                d for d in os.listdir(incoming_dir)
+                if os.path.isdir(os.path.join(incoming_dir, d))
+            ]
+        except OSError:
+            return
 
-    for host in hosts:
-        host_dir = os.path.join(incoming_dir, host)
-        events_dir = os.path.join(host_dir, "events")
-        if os.path.isdir(events_dir):
-            prune_event_folders(events_dir, max_folders, max_age_days)
+        for host in hosts:
+            host_dir = os.path.join(incoming_dir, host)
+            events_dir = os.path.join(host_dir, "events")
+            if os.path.isdir(events_dir):
+                prune_event_folders(events_dir, max_folders, max_age_days)
 
-    _remove_empty_dirs(incoming_dir)
+        _remove_empty_dirs(incoming_dir)
 
 
 def run_retention_pass(cfg) -> None:

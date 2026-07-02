@@ -219,7 +219,11 @@ class CollectorServer:
                             arc = os.path.relpath(full, os.path.dirname(folder))
                             zf.write(full, arc)
                 return tmp_path, True
-            except OSError:
+            except Exception:
+                # Catch broadly (not just OSError): zipfile can raise other
+                # exception types (e.g. zipfile.LargeZipFile, ValueError), and
+                # any of them must still trigger cleanup or the temp file
+                # leaks on the SD card.
                 try:
                     os.remove(tmp_path)
                 except OSError:
