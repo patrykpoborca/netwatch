@@ -242,6 +242,22 @@ class TestConfigNullSections(unittest.TestCase):
         # The exact call sites cmd_run uses must not raise.
         self.assertEqual(cfg.log_management.get("prune_interval_seconds", 3600), 3600)
 
+    def test_null_leaf_key_restored_by_load_config(self):
+        # A single nulled leaf key must not crash JsonlLogger at startup.
+        import json as _json
+        from netwatch.config import load_config
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "config.json")
+            with open(p, "w", encoding="utf-8") as fh:
+                _json.dump({"log_management": {"max_jsonl_mb": None}}, fh)
+            cfg = load_config(p)
+            self.assertEqual(cfg.log_management["max_jsonl_mb"], 50)
+            # Nullable-by-design key keeps its meaning.
+            with open(p, "w", encoding="utf-8") as fh:
+                _json.dump({"collector": {"auth_token": None}}, fh)
+            cfg = load_config(p)
+            self.assertIsNone(cfg.collector["auth_token"])
+
     def test_null_collector_returns_empty_dict(self):
         raw = default_config_dict()
         raw["collector"] = None

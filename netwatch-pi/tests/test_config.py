@@ -65,6 +65,19 @@ class TestNullSectionsDegradeToDefaults(unittest.TestCase):
         # Other keys backfilled from defaults.
         self.assertEqual(cfg.log_management["max_rotated_jsonl_files"], 5)
 
+    def test_null_leaf_key_restored_to_default(self):
+        # {"log_management": {"max_jsonl_mb": null}} previously survived the
+        # merge as None and crashed int(...) at startup.
+        cfg = self._load({"log_management": {"max_jsonl_mb": None}})
+        self.assertEqual(cfg.log_management["max_jsonl_mb"], 50)
+
+    def test_nullable_by_design_keys_stay_null(self):
+        # collector.auth_token null means "auto-generate" and token_file null
+        # means "default path" — normalization must NOT overwrite them.
+        cfg = self._load({"collector": {"auth_token": None, "token_file": None}})
+        self.assertIsNone(cfg.collector["auth_token"])
+        self.assertIsNone(cfg.collector["token_file"])
+
     def test_scalar_null_still_respected(self):
         # gateway_ip_override: null is a legitimate explicit value and must NOT
         # be "restored" to anything.

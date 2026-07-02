@@ -153,16 +153,23 @@ def load_config(path: str | None = None) -> Config:
     merged = _deep_merge(DEFAULTS, user_data)
 
     # Normalize the dict-valued sections. A user config that sets e.g.
-    # "log_management": null survives the deep-merge as None (the merge only
-    # backfills MISSING keys, not explicit nulls), and every consumer indexes
-    # these sections directly (cfg.log_management["max_jsonl_mb"], ...), which
-    # would crash the watchdog at startup — violating this module's
-    # "never crash on a partial config" contract. None is never a meaningful
-    # value for these sections, so restore the full defaults. (The Windows app
-    # already defends the same case in its Config properties.)
+    # "log_management": null — or an individual key like
+    # "log_management": {"max_jsonl_mb": null} — survives the deep-merge as
+    # None (the merge only backfills MISSING keys, not explicit nulls), and
+    # consumers index these directly (int(cfg.log_management["max_jsonl_mb"]),
+    # ...), which would crash the watchdog at startup — violating this
+    # module's "never crash on a partial config" contract. Restore defaults
+    # for a nulled section and for nulled keys within it, EXCEPT keys whose
+    # default is itself None (e.g. collector.auth_token / token_file), where
+    # null is a meaningful value.
     for section in ("targets", "log_management", "collector"):
+        section_defaults = DEFAULTS[section]
         if not isinstance(merged.get(section), dict):
-            merged[section] = copy.deepcopy(DEFAULTS[section])
+            merged[section] = copy.deepcopy(section_defaults)
+            continue
+        for key, default_value in section_defaults.items():
+            if merged[section].get(key) is None and default_value is not None:
+                merged[section][key] = copy.deepcopy(default_value)
 
     return Config(merged, path=resolved)
 
