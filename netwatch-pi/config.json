@@ -32,6 +32,7 @@
     "bind_host": "0.0.0.0",
     "bind_port": 8787,
     "auth_token": null,
+    "token_file": null,
     "incoming_dir": "/var/log/netwatch-pi/incoming",
     "max_incoming_mb": 500
   }

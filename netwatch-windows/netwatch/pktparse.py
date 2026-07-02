@@ -28,8 +28,14 @@ except Exception:  # noqa: BLE001
 
 
 def available() -> bool:
-    """True if any optional packet parser is importable."""
-    return _HAVE_SCAPY or _HAVE_PYSHARK
+    """True if a parser :func:`summarize_capture` actually implements is importable.
+
+    Only the scapy path is implemented today. pyshark's presence is detected
+    (``_HAVE_PYSHARK``) but must NOT enable this — otherwise a pyshark-only
+    environment reports parsing as available while every summarize call
+    silently returns None.
+    """
+    return _HAVE_SCAPY
 
 
 def summarize_capture(pcap_path: str, max_packets: int = 50000) -> Optional[str]:

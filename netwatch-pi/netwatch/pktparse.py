@@ -27,12 +27,19 @@ def is_available() -> bool:
     return _SCAPY_AVAILABLE
 
 
-def parse_pcap(path: str, windows_mac: Optional[str] = None) -> Optional[Dict]:
+def parse_pcap(
+    path: str, windows_mac: Optional[str] = None, max_packets: int = 50000
+) -> Optional[Dict]:
     """Parse ``path`` and return a summary dict, or None if unavailable/failed.
 
     The summary counts total/broadcast/multicast/ARP/DHCP/DNS/mDNS/SSDP frames
     and lists top source MACs / source + destination IPs, plus whether a MAC
     matching the Windows desktop appeared repeatedly.
+
+    ``max_packets`` bounds the per-packet loop (mirroring the Windows side's
+    cap) so a storm-sized capture cannot pin the CPU during snapshot creation.
+    A truncated/corrupt pcap (including the empty placeholder file written
+    when tcpdump cannot run) makes ``rdpcap`` raise, which returns None.
     """
     if not _SCAPY_AVAILABLE:
         return None
@@ -60,7 +67,10 @@ def parse_pcap(path: str, windows_mac: Optional[str] = None) -> Optional[Dict]:
     dst_ips = collections.Counter()
     win_mac = (windows_mac or "").lower() or None
 
-    for pkt in packets:
+    for i, pkt in enumerate(packets):
+        if i >= max_packets:
+            summary["truncated_at"] = max_packets
+            break
         summary["total_packets"] += 1
         try:
             if Ether in pkt:

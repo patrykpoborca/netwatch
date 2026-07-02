@@ -59,9 +59,14 @@ DEFAULTS: Dict[str, Any] = {
         "enabled": True,
         "bind_host": "0.0.0.0",
         "bind_port": 8787,
-        # If set, every endpoint requires "Authorization: Bearer <token>".
-        # If null, the server is open and trusts the LAN (documented in README).
+        # Auth for every endpoint ("Authorization: Bearer <token>"):
+        #   string -> that token is required;
+        #   null (default) -> a token is auto-generated once and persisted to
+        #     token_file, so the collector is never accidentally wide open;
+        #   false -> auth explicitly disabled (open, trusted-LAN only).
         "auth_token": None,
+        # Where the auto-generated token is persisted (null -> <output_dir>/collector.token).
+        "token_file": None,
         "incoming_dir": "/var/log/netwatch-pi/incoming",
         # Hard cap on the total size of incoming/ pushed logs to protect the SD card.
         "max_incoming_mb": 500,
@@ -146,6 +151,19 @@ def load_config(path: str | None = None) -> Config:
         user_data = {}
 
     merged = _deep_merge(DEFAULTS, user_data)
+
+    # Normalize the dict-valued sections. A user config that sets e.g.
+    # "log_management": null survives the deep-merge as None (the merge only
+    # backfills MISSING keys, not explicit nulls), and every consumer indexes
+    # these sections directly (cfg.log_management["max_jsonl_mb"], ...), which
+    # would crash the watchdog at startup — violating this module's
+    # "never crash on a partial config" contract. None is never a meaningful
+    # value for these sections, so restore the full defaults. (The Windows app
+    # already defends the same case in its Config properties.)
+    for section in ("targets", "log_management", "collector"):
+        if not isinstance(merged.get(section), dict):
+            merged[section] = copy.deepcopy(DEFAULTS[section])
+
     return Config(merged, path=resolved)
 
 
