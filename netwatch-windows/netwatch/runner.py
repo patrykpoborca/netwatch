@@ -19,6 +19,41 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 
+# PowerShell's tokenizer treats several Unicode "smart"/typographic single-quote
+# characters as fully equivalent to the ASCII apostrophe when parsing single-quoted
+# string literals — any of them can OPEN or CLOSE a '...' literal. Escaping only the
+# ASCII ' would therefore let an attacker-controlled value close the literal with a
+# smart quote and inject code. Normalize every variant to the ASCII ' first, then
+# double, so the whole value stays inert data. (Set per PowerShell's quote handling:
+# U+2018, U+2019, U+201A, U+201B.)
+_PS_SINGLE_QUOTE_VARIANTS = "‘’‚‛"
+
+
+def ps_quote(value: object) -> str:
+    """Escape ``value`` for safe embedding inside a single-quoted PowerShell string.
+
+    Every dynamic value the watchdog interpolates into a ``powershell.exe -Command``
+    string (adapter aliases, ping targets, DNS names, gateway IPs, capture file
+    paths) is wrapped in single quotes by the callers. Without escaping, a value
+    containing a single quote (e.g. a network adapter named ``foo'; <payload>; '``
+    installed by a VPN/virtual-adapter driver, or a hostile ``config.json`` field)
+    closes the quoted literal and injects arbitrary PowerShell that runs with the
+    watchdog's privileges (SYSTEM/highest when installed as a scheduled task).
+
+    PowerShell also accepts the typographic single quotes in
+    ``_PS_SINGLE_QUOTE_VARIANTS`` as literal-string delimiters, so those must be
+    neutralized too — we fold them to the ASCII apostrophe before doubling. The
+    result is ASCII-only and cannot break out of the surrounding ``'...'``.
+
+    Returns the escaped inner text WITHOUT the surrounding quotes, so callers keep
+    their existing ``'{...}'`` quoting.
+    """
+    text = str(value)
+    for variant in _PS_SINGLE_QUOTE_VARIANTS:
+        text = text.replace(variant, "'")
+    return text.replace("'", "''")
+
+
 @dataclass
 class CommandResult:
     """Result of a single external command invocation (never raises)."""

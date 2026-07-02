@@ -85,8 +85,8 @@ def cmd_run(cfg: Config, repair: bool = False) -> int:
 
     # Retention pass at startup, then periodically.
     _run_prune(cfg)
-    last_prune = time.monotonic()
     prune_interval = float(cfg.log_management.get("prune_interval_seconds", 3600))
+    prune_state = {"last": time.monotonic(), "interval": prune_interval}
 
     _log(
         f"Starting watchdog: poll={cfg.poll_interval_seconds}s "
@@ -97,46 +97,17 @@ def cmd_run(cfg: Config, repair: bool = False) -> int:
     try:
         while True:
             cycle_start = time.monotonic()
-            error_log = CommandErrorLog()
-
-            # 1. Collect a sample (best-effort; never raises).
+            # The whole cycle is guarded: a persistent watchdog whose entire
+            # purpose is to survive outages must never let one unexpected
+            # exception (e.g. snapshot creation raising OSError when the disk
+            # fills, or the state machine hitting bad data) kill the loop. This
+            # mirrors the Pi watchdog's per-poll guard.
             try:
-                sample = collect_sample(cfg, error_log)
-            except Exception as exc:  # noqa: BLE001 - last-resort guard
-                _log(f"sample collection error (continuing): {exc}")
-                sample = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), "error": str(exc)}
+                _run_cycle(cfg, logger, collector, sm, history, repair, prune_state)
+            except Exception as exc:  # noqa: BLE001 - last-resort loop guard
+                _log(f"cycle error (continuing): {exc}")
 
-            # 2. Classify + run the state machine.
-            hist_list = list(history)
-            classification = state.classify(sample, hist_list)
-            sample["classification"] = classification
-
-            # 3. Write the JSONL line (must work even with no internet).
-            try:
-                logger.append(sample)
-            except Exception as exc:  # noqa: BLE001
-                _log(f"jsonl append error (continuing): {exc}")
-
-            # 4. Best-effort push to the Pi collector (never blocks/crashes).
-            try:
-                collector.push_sample(sample, error_log)
-            except Exception as exc:  # noqa: BLE001
-                error_log.record_raw("collector.push_sample", str(exc))
-
-            # 5. State machine decides whether to snapshot.
-            should_event, reasons = sm.update(sample)
-            if should_event:
-                _log(f"EVENT triggered: {classification} :: {', '.join(reasons)}")
-                _handle_event(cfg, classification, sample, hist_list, reasons, collector, repair)
-
-            history.append(sample)
-
-            # 6. Periodic retention pass.
-            if (time.monotonic() - last_prune) >= prune_interval:
-                _run_prune(cfg)
-                last_prune = time.monotonic()
-
-            # 7. Sleep the remainder of the poll interval.
+            # Sleep the remainder of the poll interval.
             elapsed = time.monotonic() - cycle_start
             time.sleep(max(0.0, cfg.poll_interval_seconds - elapsed))
     except KeyboardInterrupt:
@@ -146,6 +117,83 @@ def cmd_run(cfg: Config, repair: bool = False) -> int:
         except Exception:  # noqa: BLE001
             pass
         return 0
+
+
+def _run_cycle(
+    cfg: Config,
+    logger: JsonlLogger,
+    collector: Collector,
+    sm: "state.StateMachine",
+    history: Deque[Dict[str, Any]],
+    repair: bool,
+    prune_state: Dict[str, float],
+) -> None:
+    """Run one poll/classify/log/push/event/prune cycle. Never raises.
+
+    Extracted from :func:`cmd_run` so the loop body can be tested in isolation and
+    so every step is individually guarded — no single failure (a raising snapshot,
+    classifier, or retention pass) can escape and stop the watchdog.
+    """
+    error_log = CommandErrorLog()
+
+    # 1. Collect a sample (best-effort; never raises).
+    try:
+        sample = collect_sample(cfg, error_log)
+    except Exception as exc:  # noqa: BLE001 - last-resort guard
+        _log(f"sample collection error (continuing): {exc}")
+        sample = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), "error": str(exc)}
+
+    # 2. Classify.
+    hist_list = list(history)
+    try:
+        classification = state.classify(sample, hist_list)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"classify error (continuing): {exc}")
+        classification = "healthy"
+    sample["classification"] = classification
+
+    # 3. Write the JSONL line (must work even with no internet).
+    try:
+        logger.append(sample)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"jsonl append error (continuing): {exc}")
+
+    # 4. Best-effort push to the Pi collector (never blocks/crashes).
+    try:
+        collector.push_sample(sample, error_log)
+    except Exception as exc:  # noqa: BLE001
+        error_log.record_raw("collector.push_sample", str(exc))
+
+    # 5. State machine decides whether to snapshot.
+    try:
+        # sm.update() advances last_event_time (starts the cooldown) as soon as it
+        # decides an event should fire — before the snapshot is actually captured.
+        # Capture the prior anchor so that if _handle_event fails we can roll the
+        # cooldown back: otherwise a transient snapshot failure would burn the full
+        # event_cooldown_seconds (300s default) with NO evidence captured, and the
+        # next degraded cycles would be suppressed even though nothing was recorded.
+        cooldown_anchor = sm.last_event_time
+        should_event, reasons = sm.update(sample)
+        if should_event:
+            _log(f"EVENT triggered: {classification} :: {', '.join(reasons)}")
+            try:
+                _handle_event(cfg, classification, sample, hist_list, reasons, collector, repair)
+            except Exception as exc:  # noqa: BLE001 - snapshot must not kill the loop
+                sm.last_event_time = cooldown_anchor  # roll back so we retry the snapshot
+                _log(f"event handling error (continuing; cooldown rolled back to retry): {exc}")
+    except Exception as exc:  # noqa: BLE001 - state-machine failure must not kill the loop
+        _log(f"event handling error (continuing): {exc}")
+
+    history.append(sample)
+
+    # 6. Periodic retention pass.
+    now = time.monotonic()
+    if (now - prune_state["last"]) >= prune_state["interval"]:
+        try:
+            _run_prune(cfg)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"retention pass error (continuing): {exc}")
+        prune_state["last"] = now
 
 
 def _handle_event(

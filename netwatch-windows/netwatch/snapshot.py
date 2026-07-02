@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from . import state
 from .config import Config
-from .runner import CommandErrorLog, run_cmd, run_powershell
+from .runner import CommandErrorLog, ps_quote, run_cmd, run_powershell
 
 
 # Map of output filename -> (kind, command). kind is "ps" or "cmd".
@@ -177,16 +177,19 @@ def _capture_pktmon(
     # Reset any prior filters, add the interesting low-volume protocols, then capture.
     # We run the whole sequence inside a single PowerShell invocation so Start-Sleep
     # bounds the capture window precisely and we always stop even on partial failure.
+    q_etl = ps_quote(etl_path)
+    q_pcap = ps_quote(pcap_path)
+    q_raw = ps_quote(raw_etl_path)
     script = (
         "pktmon filter remove | Out-Null; "
         "pktmon filter add NetwatchDNS -p 53 | Out-Null; "
         "pktmon filter add NetwatchDHCPs -p 67 | Out-Null; "
         "pktmon filter add NetwatchDHCPc -p 68 | Out-Null; "
-        f"pktmon start --capture --pkt-size 0 --comp nics --file-name '{etl_path}' | Out-Null; "
-        f"Start-Sleep -Seconds {seconds}; "
+        f"pktmon start --capture --pkt-size 0 --comp nics --file-name '{q_etl}' | Out-Null; "
+        f"Start-Sleep -Seconds {int(seconds)}; "
         "pktmon stop | Out-Null; "
-        f"if(Test-Path '{etl_path}'){{ Copy-Item '{etl_path}' '{raw_etl_path}' -ErrorAction SilentlyContinue }}; "
-        f"pktmon etl2pcap '{etl_path}' --out '{pcap_path}' | Out-Null"
+        f"if(Test-Path -LiteralPath '{q_etl}'){{ Copy-Item -LiteralPath '{q_etl}' -Destination '{q_raw}' -ErrorAction SilentlyContinue }}; "
+        f"pktmon etl2pcap '{q_etl}' --out '{q_pcap}' | Out-Null"
     )
     # Total timeout = capture window + generous slack for start/stop/conversion.
     res = run_powershell(
@@ -202,8 +205,8 @@ def _capture_netsh(folder: str, seconds: int, error_log: CommandErrorLog) -> Non
     """Fallback packet capture via ``netsh trace`` -> netsh_trace.etl."""
     trace_path = os.path.join(folder, "netsh_trace.etl")
     script = (
-        f"netsh trace start capture=yes report=no persistent=no tracefile='{trace_path}' | Out-Null; "
-        f"Start-Sleep -Seconds {seconds}; "
+        f"netsh trace start capture=yes report=no persistent=no tracefile='{ps_quote(trace_path)}' | Out-Null; "
+        f"Start-Sleep -Seconds {int(seconds)}; "
         "netsh trace stop | Out-Null"
     )
     run_powershell(script, error_log=error_log, timeout=seconds + 60, label="netsh trace capture")

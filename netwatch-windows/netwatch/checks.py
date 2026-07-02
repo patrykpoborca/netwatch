@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .runner import CommandErrorLog, run_cmd, run_powershell
+from .runner import CommandErrorLog, ps_quote, run_cmd, run_powershell
 
 
 # Substrings (case-insensitive) that mark an adapter as "suspicious" per the spec.
@@ -141,8 +141,9 @@ def get_ip_configuration(alias: Optional[str], error_log: CommandErrorLog) -> Di
     Falls back to a global ``Get-NetIPConfiguration`` if no alias resolves.
     """
     if alias:
+        q_alias = ps_quote(alias)
         script = (
-            f"$c = Get-NetIPConfiguration -InterfaceAlias '{alias}' -ErrorAction SilentlyContinue; "
+            f"$c = Get-NetIPConfiguration -InterfaceAlias '{q_alias}' -ErrorAction SilentlyContinue; "
             "if(-not $c){ $c = Get-NetIPConfiguration | Where-Object {$_.IPv4Address} | Select-Object -First 1 }; "
             "[pscustomobject]@{ "
             "IPv4 = ($c.IPv4Address.IPAddress | Select-Object -First 1); "
@@ -186,8 +187,9 @@ def get_link_state(alias: Optional[str], error_log: CommandErrorLog) -> Dict[str
             "interface_description": None,
             "mac_address": None,
         }
+    q_alias = ps_quote(alias)
     script = (
-        f"$a = Get-NetAdapter -Name '{alias}' -ErrorAction SilentlyContinue; "
+        f"$a = Get-NetAdapter -Name '{q_alias}' -ErrorAction SilentlyContinue; "
         "if($a){ [pscustomobject]@{ "
         "Up = ($a.Status -eq 'Up'); "
         "LinkSpeed = [string]$a.LinkSpeed; "
@@ -217,8 +219,9 @@ def get_adapter_statistics(alias: Optional[str], error_log: CommandErrorLog) -> 
     }
     if not alias:
         return blank
+    q_alias = ps_quote(alias)
     script = (
-        f"$s = Get-NetAdapterStatistics -Name '{alias}' -ErrorAction SilentlyContinue; "
+        f"$s = Get-NetAdapterStatistics -Name '{q_alias}' -ErrorAction SilentlyContinue; "
         "if($s){ [pscustomobject]@{ "
         "Rx = [int64]$s.ReceivedBytes; "
         "Tx = [int64]$s.SentBytes; "
@@ -251,7 +254,7 @@ def ping_ok(target: str, error_log: CommandErrorLog, count: int = 2, timeout: fl
     if not target:
         return False
     script = (
-        f"if(Test-Connection -ComputerName '{target}' -Count {count} -Quiet "
+        f"if(Test-Connection -ComputerName '{ps_quote(target)}' -Count {int(count)} -Quiet "
         "-ErrorAction SilentlyContinue){'TRUE'}else{'FALSE'}"
     )
     res = run_powershell(script, error_log=error_log, timeout=timeout, label=f"ping {target}")
@@ -290,7 +293,7 @@ def dns_resolution_ok(names: List[str], error_log: CommandErrorLog) -> bool:
         return True  # nothing to resolve -> not a DNS failure
     for name in names:
         script = (
-            f"$r = Resolve-DnsName '{name}' -ErrorAction SilentlyContinue; "
+            f"$r = Resolve-DnsName '{ps_quote(name)}' -ErrorAction SilentlyContinue; "
             "if($r){'TRUE'}else{'FALSE'}"
         )
         res = run_powershell(script, error_log=error_log, timeout=12.0, label=f"Resolve-DnsName {name}")
@@ -308,7 +311,7 @@ def gateway_mac(gateway: Optional[str], error_log: CommandErrorLog) -> Optional[
     if not gateway:
         return None
     script = (
-        f"$n = Get-NetNeighbor -IPAddress '{gateway}' -ErrorAction SilentlyContinue | "
+        f"$n = Get-NetNeighbor -IPAddress '{ps_quote(gateway)}' -ErrorAction SilentlyContinue | "
         "Where-Object {$_.LinkLayerAddress -and $_.LinkLayerAddress -ne '00-00-00-00-00-00'} | "
         "Select-Object -First 1; if($n){$n.LinkLayerAddress}"
     )
