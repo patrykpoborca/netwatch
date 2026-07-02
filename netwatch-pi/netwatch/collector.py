@@ -318,10 +318,16 @@ class CollectorServer:
                 appender.append(line)
                 written += 1
 
-        # Enforce the incoming size cap after writing.
-        logmgmt.enforce_incoming_cap(
-            self.incoming_dir, int(self.collector_cfg["max_incoming_mb"])
-        )
+        # Enforce the same retention as event ingests: the byte cap alone
+        # (as this used to call in isolation) ignores directory/inode
+        # overhead, so many tiny sample posts under unique host_labels could
+        # stay under max_incoming_mb while creating unbounded host
+        # directories — bypassing MAX_INCOMING_HOSTS until a later event
+        # ingest or the periodic (default hourly) retention pass happened to
+        # run. Samples-only hosts have no "events" subdir, so
+        # prune_incoming_events's per-host step is a no-op for them, but its
+        # host-count cap (_prune_excess_hosts) still applies.
+        self._enforce_incoming_retention()
         return 200, {"status": "ok", "written": written}
 
     def ingest_event_json(self, body: bytes) -> Tuple[int, Dict]:
