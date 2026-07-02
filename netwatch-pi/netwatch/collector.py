@@ -46,9 +46,12 @@ Auth (all endpoints, if auth_token set): Authorization: Bearer <token>; else 401
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
+import shutil
+import tempfile
 import threading
 import zipfile
 from datetime import datetime, timezone
@@ -62,8 +65,16 @@ from . import logmgmt
 # Hard limits to keep the server safe on a small device.
 MAX_JSON_BODY_BYTES = 8 * 1024 * 1024       # 8 MB for JSON ingest
 MAX_ZIP_BODY_BYTES = 64 * 1024 * 1024       # 64 MB per uploaded event zip
+# Cap on the *uncompressed* size of an ingested zip. Checked against the
+# central directory (cheap) before ``testzip()`` (which fully decompresses
+# every member) so a small, highly-compressible "zip bomb" body can't pin the
+# CPU decompressing gigabytes on a low-powered Pi.
+MAX_ZIP_UNCOMPRESSED_BYTES = 256 * 1024 * 1024  # 256 MB
 SAMPLE_TAIL_DEFAULT = 100
 SAMPLE_TAIL_MAX = 5000
+# Chunk size used when streaming file/zip responses to avoid buffering
+# multi-MB event archives entirely in memory.
+STREAM_CHUNK_BYTES = 64 * 1024
 
 
 def _sanitize_label(value: Optional[str], fallback: str = "unknown-host") -> str:
@@ -107,7 +118,21 @@ class CollectorServer:
         if not header_value:
             return False
         expected = f"Bearer {self.auth_token}"
-        return header_value == expected
+        # Constant-time comparison: this token is the *only* access control
+        # once an operator exposes the collector beyond the LAN, so a
+        # short-circuiting `==` would let an attacker recover it byte-by-byte
+        # via response timing. Compare as bytes (not str): hmac.compare_digest
+        # raises TypeError on non-ASCII *str* arguments, which would otherwise
+        # turn a malformed Authorization header into a 500 (via the handler's
+        # catch-all) instead of a normal 401 — an unauthenticated client
+        # shouldn't be able to provoke internal-error responses.
+        try:
+            return hmac.compare_digest(
+                header_value.encode("utf-8", "surrogateescape"),
+                expected.encode("utf-8"),
+            )
+        except (TypeError, UnicodeEncodeError, UnicodeDecodeError):
+            return False
 
     # ------------------------- READ handlers ----------------------------- #
     def health(self) -> Dict:
@@ -178,30 +203,41 @@ class CollectorServer:
                 return 500, {"error": "could not read summary.json"}
         return 404, {"error": "event not found"}
 
-    def event_zip_bytes(self, event_id: str) -> Optional[bytes]:
-        """Return a zip of an event folder (or the stored archive), or None."""
+    def event_zip_path(self, event_id: str) -> Optional[Tuple[str, bool]]:
+        """Return (path, is_temp) to a zip file for the event, or None.
+
+        Returns the already-stored ``<event>.zip`` archive directly when one
+        exists, or builds one on disk (never fully in memory) for a live
+        event folder. The caller streams the file to the response and, if
+        ``is_temp`` is True, must delete it afterwards.
+        """
         event_id = _sanitize_label(event_id, fallback="")
         if not event_id:
             return None
         folder = os.path.join(self.events_dir, event_id)
         archive = folder + ".zip"
         if os.path.isfile(archive):
-            try:
-                with open(archive, "rb") as fh:
-                    return fh.read()
-            except OSError:
-                return None
+            return archive, False
         if os.path.isdir(folder):
-            buf = BytesIO()
+            fd, tmp_path = tempfile.mkstemp(prefix="netwatch-event-", suffix=".zip")
+            os.close(fd)
             try:
-                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
                     for root, _dirs, files in os.walk(folder):
                         for fname in files:
                             full = os.path.join(root, fname)
                             arc = os.path.relpath(full, os.path.dirname(folder))
                             zf.write(full, arc)
-                return buf.getvalue()
-            except OSError:
+                return tmp_path, True
+            except Exception:
+                # Catch broadly (not just OSError): zipfile can raise other
+                # exception types (e.g. zipfile.LargeZipFile, ValueError), and
+                # any of them must still trigger cleanup or the temp file
+                # leaks on the SD card.
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
                 return None
         return None
 
@@ -282,10 +318,16 @@ class CollectorServer:
                 appender.append(line)
                 written += 1
 
-        # Enforce the incoming size cap after writing.
-        logmgmt.enforce_incoming_cap(
-            self.incoming_dir, int(self.collector_cfg["max_incoming_mb"])
-        )
+        # Enforce the same retention as event ingests: the byte cap alone
+        # (as this used to call in isolation) ignores directory/inode
+        # overhead, so many tiny sample posts under unique host_labels could
+        # stay under max_incoming_mb while creating unbounded host
+        # directories — bypassing MAX_INCOMING_HOSTS until a later event
+        # ingest or the periodic (default hourly) retention pass happened to
+        # run. Samples-only hosts have no "events" subdir, so
+        # prune_incoming_events's per-host step is a no-op for them, but its
+        # host-count cap (_prune_excess_hosts) still applies.
+        self._enforce_incoming_retention()
         return 200, {"status": "ok", "written": written}
 
     def ingest_event_json(self, body: bytes) -> Tuple[int, Dict]:
@@ -318,9 +360,7 @@ class CollectorServer:
         except OSError as exc:
             return 500, {"error": f"could not store summary: {exc}"}
 
-        logmgmt.enforce_incoming_cap(
-            self.incoming_dir, int(self.collector_cfg["max_incoming_mb"])
-        )
+        self._enforce_incoming_retention()
         return 200, {"status": "ok", "host_label": host, "event_id": event_id}
 
     def ingest_event_zip(
@@ -337,6 +377,16 @@ class CollectorServer:
         # Validate it is actually a zip before storing.
         try:
             with zipfile.ZipFile(BytesIO(body)) as zf:
+                # Check the (cheap, central-directory-only) uncompressed total
+                # *before* testzip(), which fully decompresses every member.
+                # Without this, a small, highly-compressible body can force
+                # the handler thread to spend a long time (and steady CPU)
+                # decompressing a "zip bomb" — a CPU-exhaustion DoS on a
+                # low-powered Pi that's reachable by anyone on the LAN when
+                # auth_token is unset (the default).
+                total_uncompressed = sum(zi.file_size for zi in zf.infolist())
+                if total_uncompressed > MAX_ZIP_UNCOMPRESSED_BYTES:
+                    return 400, {"error": "zip expands too large; rejected"}
                 if zf.testzip() is not None:
                     return 400, {"error": "corrupt zip upload"}
         except zipfile.BadZipFile:
@@ -350,10 +400,38 @@ class CollectorServer:
         except OSError as exc:
             return 500, {"error": f"could not store zip: {exc}"}
 
-        logmgmt.enforce_incoming_cap(
-            self.incoming_dir, int(self.collector_cfg["max_incoming_mb"])
-        )
+        self._enforce_incoming_retention()
         return 200, {"status": "ok", "host_label": host, "event_id": event_id}
+
+    def _enforce_incoming_retention(self) -> None:
+        """Apply both folder-count/age retention and the total-byte cap.
+
+        Run synchronously after every event ingest (in addition to the
+        periodic ``run_retention_pass``) so a burst of pushed events from an
+        open LAN collector can't grow unbounded between prune passes
+        (default ``prune_interval_seconds`` is 3600s).
+
+        Deliberately defensive about config shape: ``log_management`` (or one
+        of its keys) being missing/``null`` in config.json must not turn an
+        otherwise-successful ingest (the file is already written by this
+        point) into a 500 response — retention is best-effort housekeeping,
+        not something that should fail the request.
+        """
+        lm = self.cfg.log_management or {}
+        try:
+            logmgmt.prune_incoming_events(
+                self.incoming_dir,
+                int(lm.get("max_event_folders", 50)),
+                int(lm.get("max_event_age_days", 30)),
+            )
+        except (TypeError, ValueError):
+            pass
+        try:
+            logmgmt.enforce_incoming_cap(
+                self.incoming_dir, int(self.collector_cfg.get("max_incoming_mb", 500))
+            )
+        except (TypeError, ValueError):
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -433,17 +511,27 @@ def make_handler(server_logic: CollectorServer):
             self.end_headers()
             self.wfile.write(payload)
 
-        def _send_bytes(self, status: int, data: bytes, content_type: str,
-                        filename: Optional[str] = None) -> None:
+        def _send_file(self, status: int, path: str, content_type: str,
+                       filename: Optional[str] = None) -> None:
+            """Stream a file from disk to the response in fixed-size chunks.
+
+            Avoids holding a full multi-MB event archive in memory (as a naive
+            ``fh.read()`` / in-memory ``BytesIO`` would), which matters both
+            for the documented "streamed" download contract and because
+            several concurrent downloads (the server is threaded) could
+            otherwise multiply memory use enough to OOM a small Pi.
+            """
+            size = os.path.getsize(path)
             self.send_response(status)
             self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Length", str(size))
             if filename:
                 self.send_header(
                     "Content-Disposition", f'attachment; filename="{filename}"'
                 )
             self.end_headers()
-            self.wfile.write(data)
+            with open(path, "rb") as fh:
+                shutil.copyfileobj(fh, self.wfile, length=STREAM_CHUNK_BYTES)
 
         def _authorized(self) -> bool:
             return server_logic.check_auth(self.headers.get("Authorization"))
@@ -509,14 +597,22 @@ def make_handler(server_logic: CollectorServer):
             if m:
                 event_id = m.group(1)
                 if m.group(2):  # /download
-                    data = server_logic.event_zip_bytes(event_id)
-                    if data is None:
+                    result = server_logic.event_zip_path(event_id)
+                    if result is None:
                         self._send_json(404, {"error": "event not found"})
                         return
-                    self._send_bytes(
-                        200, data, "application/zip",
-                        filename=_sanitize_label(event_id) + ".zip",
-                    )
+                    zip_path, is_temp = result
+                    try:
+                        self._send_file(
+                            200, zip_path, "application/zip",
+                            filename=_sanitize_label(event_id) + ".zip",
+                        )
+                    finally:
+                        if is_temp:
+                            try:
+                                os.remove(zip_path)
+                            except OSError:
+                                pass
                     return
                 status, obj = server_logic.event_summary(event_id)
                 self._send_json(status, obj)
