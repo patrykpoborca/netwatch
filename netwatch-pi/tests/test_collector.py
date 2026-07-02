@@ -67,6 +67,15 @@ class TestReadBodyBounded(unittest.TestCase):
         r = _TricklingReader(b"x" * 1000, per_call=1)
         self.assertIsNone(_read_body_bounded(r, 1000, 10_000, 30, now=lambda: next(ticks)))
 
+    def test_completing_chunk_arriving_late_is_rejected(self):
+        # The final chunk completes the declared 2-byte body, but the post-read
+        # clock is already past the deadline -> must be REJECTED, not accepted.
+        # setup=0 -> deadline=30; iter1 top=0, after-read=10; iter2 top=10,
+        # after-read=40 (>30) -> None.
+        ticks = iter([0.0, 0.0, 10.0, 10.0, 40.0])
+        r = _TricklingReader(b"ab", per_call=1)
+        self.assertIsNone(_read_body_bounded(r, 2, 1024, 30, now=lambda: next(ticks)))
+
 
 class TestSanitizeLabel(unittest.TestCase):
     def test_plain_label_kept(self):

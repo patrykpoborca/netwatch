@@ -114,6 +114,13 @@ def _read_body_bounded(
             break  # client closed the connection before sending the full body
         chunks.append(chunk)
         remaining -= len(chunk)
+        # Recheck AFTER the read: a single read1() can block up to the socket's
+        # idle timeout, so a slow sender whose completing chunk arrives just under
+        # that window could otherwise push total time past the deadline yet still
+        # be accepted (remaining hits 0 and the loop exits before the top check).
+        # Rejecting here guarantees an over-deadline body is never accepted.
+        if now() > deadline:
+            return None
     body = b"".join(chunks)
     return body if len(body) == length else None
 
