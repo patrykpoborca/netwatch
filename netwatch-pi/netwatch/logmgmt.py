@@ -313,6 +313,50 @@ def _remove_empty_dirs(root_dir: str, min_age_seconds: float = 10.0) -> None:
             pass
 
 
+# This collector is designed for a small, known number of pushing hosts
+# (typically exactly one Windows desktop paired with the Pi). Per-host
+# retention alone bounds each host_label's own event count, but not the
+# *number* of host_labels: on an open LAN collector (default auth_token is
+# null) an attacker can vary host_label on every request so each fake host's
+# events dir individually stays under max_folders while the total number of
+# host directories — and their inode cost — still grows without bound. Cap
+# the number of distinct host directories retained, regardless of how few
+# events each one holds.
+MAX_INCOMING_HOSTS = 32
+
+
+def _host_last_activity(host_dir: str) -> float:
+    """Most recent mtime of anything under ``host_dir`` (best-effort)."""
+    latest = _safe_mtime(host_dir)
+    for root, _dirs, files in os.walk(host_dir):
+        for fname in files:
+            latest = max(latest, _safe_mtime(os.path.join(root, fname)))
+    return latest
+
+
+def _prune_excess_hosts(incoming_dir: str, max_hosts: int) -> None:
+    """Delete whole host directories, oldest-activity-first, beyond ``max_hosts``.
+
+    Complements the per-host event retention in ``prune_incoming_events``: that
+    bounds each host's own folder count, this bounds how many distinct hosts
+    are retained at all.
+    """
+    try:
+        host_dirs = [
+            os.path.join(incoming_dir, d)
+            for d in os.listdir(incoming_dir)
+            if os.path.isdir(os.path.join(incoming_dir, d))
+        ]
+    except OSError:
+        return
+    if len(host_dirs) <= max_hosts:
+        return
+    host_dirs.sort(key=_host_last_activity)  # oldest activity first
+    excess = len(host_dirs) - max_hosts
+    for host_dir in host_dirs[:excess]:
+        shutil.rmtree(host_dir, ignore_errors=True)
+
+
 def prune_incoming_events(
     incoming_dir: str,
     max_folders: int,
@@ -326,7 +370,9 @@ def prune_incoming_events(
     ``enforce_incoming_cap``'s total-byte cap applied, which deletes files but
     not directories) — an open collector on the LAN could be spammed with
     unique event_ids to grow the directory tree without bound. This mirrors
-    the retention already applied to the Pi's own ``events_dir``.
+    the retention already applied to the Pi's own ``events_dir``. It also
+    enforces ``MAX_INCOMING_HOSTS`` (see ``_prune_excess_hosts``) so varying
+    ``host_label`` itself can't be used to the same end.
 
     Serialized on ``_retention_lock``: this is called synchronously after
     every event ingest on the threaded HTTP server, so concurrent pushes
@@ -351,6 +397,7 @@ def prune_incoming_events(
             if os.path.isdir(events_dir):
                 prune_event_folders(events_dir, max_folders, max_age_days)
 
+        _prune_excess_hosts(incoming_dir, MAX_INCOMING_HOSTS)
         _remove_empty_dirs(incoming_dir)
 
 

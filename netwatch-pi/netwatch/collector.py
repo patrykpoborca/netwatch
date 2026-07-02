@@ -121,8 +121,18 @@ class CollectorServer:
         # Constant-time comparison: this token is the *only* access control
         # once an operator exposes the collector beyond the LAN, so a
         # short-circuiting `==` would let an attacker recover it byte-by-byte
-        # via response timing.
-        return hmac.compare_digest(header_value, expected)
+        # via response timing. Compare as bytes (not str): hmac.compare_digest
+        # raises TypeError on non-ASCII *str* arguments, which would otherwise
+        # turn a malformed Authorization header into a 500 (via the handler's
+        # catch-all) instead of a normal 401 — an unauthenticated client
+        # shouldn't be able to provoke internal-error responses.
+        try:
+            return hmac.compare_digest(
+                header_value.encode("utf-8", "surrogateescape"),
+                expected.encode("utf-8"),
+            )
+        except (TypeError, UnicodeEncodeError, UnicodeDecodeError):
+            return False
 
     # ------------------------- READ handlers ----------------------------- #
     def health(self) -> Dict:
