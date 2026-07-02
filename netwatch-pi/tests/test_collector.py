@@ -144,6 +144,20 @@ class TestCheckAuth(unittest.TestCase):
         if os.name == "posix":
             self.assertEqual(os.stat(srv.token_file).st_mode & 0o777, 0o600)
 
+    @unittest.skipUnless(os.name == "posix", "posix permissions")
+    def test_preexisting_loose_perms_tightened_on_write(self):
+        # An EMPTY token file left behind with loose permissions must not stay
+        # world-readable once the token is written into it (os.open's mode only
+        # applies on creation; fchmod covers the pre-existing case).
+        cfg = _cfg(self._tmp.name, auth_token=None)
+        token_path = cfg.collector["token_file"]
+        with open(token_path, "w", encoding="utf-8"):
+            pass
+        os.chmod(token_path, 0o644)
+        srv = CollectorServer(cfg)
+        self.assertEqual(srv.auth_mode, "generated")
+        self.assertEqual(os.stat(token_path).st_mode & 0o777, 0o600)
+
     def test_generated_token_is_stable_across_restarts(self):
         cfg = _cfg(self._tmp.name, auth_token=None)
         first = CollectorServer(cfg).auth_token

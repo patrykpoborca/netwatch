@@ -183,7 +183,21 @@ def _load_or_create_token(token_file: str) -> Optional[str]:
     token = secrets.token_hex(16)
     try:
         os.makedirs(os.path.dirname(token_file) or ".", exist_ok=True)
-        fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # O_NOFOLLOW: refuse to write through a symlink planted at the token
+        # path (the collector typically runs as root, so following one could
+        # overwrite an arbitrary system file).
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(token_file, flags, 0o600)
+        # The mode passed to os.open only applies on CREATION; if the file
+        # already existed with looser permissions (e.g. 0644), tighten it so
+        # the token is never left world-readable.
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(token + "\n")
         return token
