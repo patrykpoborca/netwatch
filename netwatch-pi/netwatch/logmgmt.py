@@ -18,10 +18,29 @@ from __future__ import annotations
 import gzip
 import os
 import shutil
+import threading
 import time
 import zipfile
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+
+# --------------------------------------------------------------------------- #
+# Per-path locks, so concurrent appenders (e.g. the collector's threaded HTTP
+# server handling multiple pushes for the same host_label at once) can't race
+# the check-then-rotate-then-append sequence and silently drop/duplicate lines.
+# --------------------------------------------------------------------------- #
+_path_locks: Dict[str, threading.Lock] = {}
+_path_locks_guard = threading.Lock()
+
+
+def _lock_for(path: str) -> threading.Lock:
+    with _path_locks_guard:
+        lock = _path_locks.get(path)
+        if lock is None:
+            lock = threading.Lock()
+            _path_locks[path] = lock
+        return lock
 
 
 # --------------------------------------------------------------------------- #
@@ -35,6 +54,11 @@ class JsonlAppender:
     write amplification of rewriting the whole file and the SD-card wear of an
     fsync on every sample, while still being durable within seconds. Rotation is
     checked cheaply via os.stat before each write.
+
+    Appends are serialized per-path (see ``_lock_for``) so that two threads
+    writing the same file (e.g. two concurrent pushes for the same
+    ``host_label``) cannot both trigger rotation at once or have a write land
+    between another thread's rotate-copy and truncate.
     """
 
     def __init__(self, path: str, max_bytes: int, max_rotated: int):
@@ -46,10 +70,11 @@ class JsonlAppender:
     def append(self, line: str) -> None:
         """Append a single line (without trailing newline) safely."""
         try:
-            self._maybe_rotate()
-            with open(self.path, "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-                fh.flush()  # hand off to OS; no per-line fsync (SD-card friendly)
+            with _lock_for(self.path):
+                self._maybe_rotate()
+                with open(self.path, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+                    fh.flush()  # hand off to OS; no per-line fsync (SD-card friendly)
         except OSError:
             # Never let a logging failure kill the loop.
             pass
@@ -243,6 +268,60 @@ def enforce_incoming_cap(incoming_dir: str, max_mb: int) -> None:
         except OSError:
             pass
 
+    _remove_empty_dirs(incoming_dir)
+
+
+def _remove_empty_dirs(root_dir: str) -> None:
+    """Remove now-empty subdirectories under (but not including) ``root_dir``.
+
+    File-only pruning (as in ``enforce_incoming_cap``) can leave behind empty
+    ``<host>/events/<event_id>`` directories once their files are deleted;
+    left unchecked these accumulate and can exhaust inodes even while staying
+    under the byte cap.
+    """
+    for current, dirs, _files in os.walk(root_dir, topdown=False):
+        if current == root_dir:
+            continue
+        try:
+            if not os.listdir(current):
+                os.rmdir(current)
+        except OSError:
+            pass
+
+
+def prune_incoming_events(
+    incoming_dir: str,
+    max_folders: int,
+    max_age_days: int,
+) -> None:
+    """Apply event-folder retention to every pushed host's events directory.
+
+    ``incoming_dir`` holds one subdirectory per ``host_label`` that has pushed
+    samples/events (e.g. ``incoming_dir/windows-desktop/events/<event_id>/``).
+    Without this, pushed event folders were never pruned by count or age (only
+    ``enforce_incoming_cap``'s total-byte cap applied, which deletes files but
+    not directories) — an open collector on the LAN could be spammed with
+    unique event_ids to grow the directory tree without bound. This mirrors
+    the retention already applied to the Pi's own ``events_dir``.
+    """
+    if not os.path.isdir(incoming_dir):
+        return
+    try:
+        hosts = [
+            d for d in os.listdir(incoming_dir)
+            if os.path.isdir(os.path.join(incoming_dir, d))
+        ]
+    except OSError:
+        return
+
+    for host in hosts:
+        host_dir = os.path.join(incoming_dir, host)
+        events_dir = os.path.join(host_dir, "events")
+        if os.path.isdir(events_dir):
+            prune_event_folders(events_dir, max_folders, max_age_days)
+
+    _remove_empty_dirs(incoming_dir)
+
 
 def run_retention_pass(cfg) -> None:
     """Run the full retention/prune pass (JSONL + events + incoming).
@@ -274,8 +353,8 @@ def run_retention_pass(cfg) -> None:
         collector = cfg.collector
         incoming = collector.get("incoming_dir")
         if incoming:
-            prune_event_folders(
-                os.path.join(incoming, "_events_index"),  # no-op if absent
+            prune_incoming_events(
+                incoming,
                 int(lm["max_event_folders"]),
                 int(lm["max_event_age_days"]),
             )
