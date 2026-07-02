@@ -188,7 +188,7 @@ def _capture_pktmon(
         f"pktmon start --capture --pkt-size 0 --comp nics --file-name '{q_etl}' | Out-Null; "
         f"Start-Sleep -Seconds {int(seconds)}; "
         "pktmon stop | Out-Null; "
-        f"if(Test-Path '{q_etl}'){{ Copy-Item '{q_etl}' '{q_raw}' -ErrorAction SilentlyContinue }}; "
+        f"if(Test-Path -LiteralPath '{q_etl}'){{ Copy-Item -LiteralPath '{q_etl}' -Destination '{q_raw}' -ErrorAction SilentlyContinue }}; "
         f"pktmon etl2pcap '{q_etl}' --out '{q_pcap}' | Out-Null"
     )
     # Total timeout = capture window + generous slack for start/stop/conversion.
