@@ -394,16 +394,28 @@ class CollectorServer:
         periodic ``run_retention_pass``) so a burst of pushed events from an
         open LAN collector can't grow unbounded between prune passes
         (default ``prune_interval_seconds`` is 3600s).
+
+        Deliberately defensive about config shape: ``log_management`` (or one
+        of its keys) being missing/``null`` in config.json must not turn an
+        otherwise-successful ingest (the file is already written by this
+        point) into a 500 response — retention is best-effort housekeeping,
+        not something that should fail the request.
         """
-        lm = self.cfg.log_management
-        logmgmt.prune_incoming_events(
-            self.incoming_dir,
-            int(lm["max_event_folders"]),
-            int(lm["max_event_age_days"]),
-        )
-        logmgmt.enforce_incoming_cap(
-            self.incoming_dir, int(self.collector_cfg["max_incoming_mb"])
-        )
+        lm = self.cfg.log_management or {}
+        try:
+            logmgmt.prune_incoming_events(
+                self.incoming_dir,
+                int(lm.get("max_event_folders", 50)),
+                int(lm.get("max_event_age_days", 30)),
+            )
+        except (TypeError, ValueError):
+            pass
+        try:
+            logmgmt.enforce_incoming_cap(
+                self.incoming_dir, int(self.collector_cfg.get("max_incoming_mb", 500))
+            )
+        except (TypeError, ValueError):
+            pass
 
 
 # --------------------------------------------------------------------------- #

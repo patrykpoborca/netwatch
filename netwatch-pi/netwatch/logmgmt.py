@@ -357,16 +357,25 @@ def prune_incoming_events(
 def run_retention_pass(cfg) -> None:
     """Run the full retention/prune pass (JSONL + events + incoming).
 
-    Called at startup and periodically during ``run``. Best-effort; never raises.
+    Called at startup and periodically during ``run``. Best-effort; never raises
+    — a malformed/partial ``log_management`` or ``collector`` config section
+    (e.g. a key explicitly set to ``null`` in config.json, which survives the
+    deep-merge as ``None`` rather than falling back to the default) must
+    degrade to a no-op pass rather than crash this background task, per the
+    module's stated contract.
     """
-    lm = cfg.log_management
+    lm = cfg.log_management or {}
     # JSONL rotation check (in case it grew while idle / on startup).
     try:
         jpath = cfg["jsonl_log_path"]
         max_bytes = int(lm["max_jsonl_mb"]) * 1024 * 1024
         if os.path.exists(jpath) and os.path.getsize(jpath) >= max_bytes:
-            rotate_jsonl(jpath, int(lm["max_rotated_jsonl_files"]))
-    except (OSError, KeyError, ValueError):
+            # Serialize with JsonlAppender's own lock: without this, a
+            # concurrent append (same path) could land between this rotate's
+            # gzip-copy and truncate and be silently discarded.
+            with _lock_for(jpath):
+                rotate_jsonl(jpath, int(lm["max_rotated_jsonl_files"]))
+    except (OSError, KeyError, ValueError, TypeError):
         pass
 
     # Event-folder retention.
@@ -376,12 +385,12 @@ def run_retention_pass(cfg) -> None:
             int(lm["max_event_folders"]),
             int(lm["max_event_age_days"]),
         )
-    except (KeyError, ValueError):
+    except (KeyError, ValueError, TypeError):
         pass
 
     # Incoming (pushed) logs retention.
     try:
-        collector = cfg.collector
+        collector = cfg.collector or {}
         incoming = collector.get("incoming_dir")
         if incoming:
             prune_incoming_events(
@@ -390,5 +399,5 @@ def run_retention_pass(cfg) -> None:
                 int(lm["max_event_age_days"]),
             )
             enforce_incoming_cap(incoming, int(collector["max_incoming_mb"]))
-    except (KeyError, ValueError):
+    except (KeyError, ValueError, TypeError):
         pass
