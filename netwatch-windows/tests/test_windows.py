@@ -54,6 +54,24 @@ class TestPsQuote(unittest.TestCase):
         self.assertEqual(ps_quote(2), "2")
         self.assertEqual(ps_quote(None), "None")
 
+    def test_typographic_quotes_normalized_and_escaped(self):
+        # PowerShell treats U+2018/U+2019/U+201A/U+201B as single-quote string
+        # delimiters, so they must be folded to ASCII ' and doubled, or an
+        # attacker could close a '...' literal with a smart quote and inject code.
+        for smart in ("‘", "’", "‚", "‛"):
+            with self.subTest(smart=smart):
+                out = ps_quote(f"a{smart}b")
+                self.assertEqual(out, "a''b")
+                self.assertTrue(out.isascii())
+                self.assertNotIn("'", out.replace("''", ""))
+
+    def test_smart_quote_injection_payload_neutralized(self):
+        payload = "Ethernet’; Remove-Item C:\\ -Recurse; ‘"
+        out = ps_quote(payload)
+        self.assertTrue(out.isascii())
+        self.assertNotIn("'", out.replace("''", ""))  # nothing can close '...'
+        self.assertEqual(f"'{out}'".count("'") % 2, 0)
+
 
 def _temp_cfg(tmpdir: str) -> Config:
     raw = default_config_dict()
