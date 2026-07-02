@@ -129,6 +129,35 @@ class TestRunCycleRobustness(unittest.TestCase):
         # Loop survived; sample recorded.
         self.assertEqual(len(self.history), 1)
 
+    def test_failed_snapshot_rolls_back_cooldown_and_retries(self):
+        # If _handle_event fails, the cooldown must NOT be consumed — otherwise the
+        # watchdog goes event_cooldown_seconds with no evidence captured. The next
+        # degraded cycle must retry the snapshot.
+        degraded = {"timestamp": "t", "link_up": False}
+        sm = state.StateMachine(failure_threshold_count=1, event_cooldown_seconds=300)
+        calls = {"n": 0}
+
+        def flaky_handle(*a, **k):
+            calls["n"] += 1
+            raise OSError("disk full")
+
+        orig_sample = app.collect_sample
+        orig_handle = app._handle_event
+        app.collect_sample = lambda cfg, err: dict(degraded)
+        app._handle_event = flaky_handle
+        try:
+            app._run_cycle(self.cfg, self.logger, self.collector, sm,
+                           self.history, False, self.prune_state)
+            # Cooldown was rolled back (still at its initial 0.0), so it did not stick.
+            self.assertEqual(sm.last_event_time, 0.0)
+            # A second degraded cycle must attempt the snapshot again (not suppressed).
+            app._run_cycle(self.cfg, self.logger, self.collector, sm,
+                           self.history, False, self.prune_state)
+        finally:
+            app.collect_sample = orig_sample
+            app._handle_event = orig_handle
+        self.assertEqual(calls["n"], 2)  # retried, not suppressed by cooldown
+
     def test_prune_raises_does_not_propagate(self):
         # Make the retention pass due, and make it raise.
         self.prune_state = {"last": 0.0, "interval": 0.0}

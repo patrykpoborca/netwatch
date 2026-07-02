@@ -166,11 +166,22 @@ def _run_cycle(
 
     # 5. State machine decides whether to snapshot.
     try:
+        # sm.update() advances last_event_time (starts the cooldown) as soon as it
+        # decides an event should fire — before the snapshot is actually captured.
+        # Capture the prior anchor so that if _handle_event fails we can roll the
+        # cooldown back: otherwise a transient snapshot failure would burn the full
+        # event_cooldown_seconds (300s default) with NO evidence captured, and the
+        # next degraded cycles would be suppressed even though nothing was recorded.
+        cooldown_anchor = sm.last_event_time
         should_event, reasons = sm.update(sample)
         if should_event:
             _log(f"EVENT triggered: {classification} :: {', '.join(reasons)}")
-            _handle_event(cfg, classification, sample, hist_list, reasons, collector, repair)
-    except Exception as exc:  # noqa: BLE001 - snapshot/event handling must not kill the loop
+            try:
+                _handle_event(cfg, classification, sample, hist_list, reasons, collector, repair)
+            except Exception as exc:  # noqa: BLE001 - snapshot must not kill the loop
+                sm.last_event_time = cooldown_anchor  # roll back so we retry the snapshot
+                _log(f"event handling error (continuing; cooldown rolled back to retry): {exc}")
+    except Exception as exc:  # noqa: BLE001 - state-machine failure must not kill the loop
         _log(f"event handling error (continuing): {exc}")
 
     history.append(sample)
