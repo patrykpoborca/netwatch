@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import time
 from collections import deque
@@ -41,6 +42,29 @@ def _log(msg: str) -> None:
     """Lightweight stderr logger (does not depend on the JSONL store)."""
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[netwatch {ts}] {msg}", file=sys.stderr, flush=True)
+
+
+def _install_stop_handlers(stop_flag: Dict[str, bool]) -> None:
+    """Request a clean shutdown on SIGTERM / SIGINT / SIGBREAK.
+
+    The scheduled task is stopped via task-scheduler/taskkill (SIGTERM /
+    CTRL_BREAK, not Ctrl+C), so a KeyboardInterrupt-only exit path would drop
+    the collector's in-memory sample buffer (up to ``sample_batch_size``
+    samples) on every service stop. Handlers just set a flag; the run loop
+    exits at the next check and flushes in its ``finally`` block. Failure to
+    register (non-main thread, e.g. under tests) is non-fatal.
+    """
+    def _request_stop(_signum, _frame):
+        stop_flag["stop"] = True
+
+    for sig_name in ("SIGTERM", "SIGINT", "SIGBREAK"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _request_stop)
+        except (ValueError, OSError, RuntimeError):
+            pass
 
 
 def _maybe_summarize_packets(folder: str) -> None:
@@ -94,8 +118,11 @@ def cmd_run(cfg: Config, repair: bool = False) -> int:
         f"repair={'ON' if repair else 'off'} collector={'on' if collector.enabled else 'off'}"
     )
 
+    stop_flag = {"stop": False}
+    _install_stop_handlers(stop_flag)
+
     try:
-        while True:
+        while not stop_flag["stop"]:
             cycle_start = time.monotonic()
             # The whole cycle is guarded: a persistent watchdog whose entire
             # purpose is to survive outages must never let one unexpected
@@ -107,16 +134,26 @@ def cmd_run(cfg: Config, repair: bool = False) -> int:
             except Exception as exc:  # noqa: BLE001 - last-resort loop guard
                 _log(f"cycle error (continuing): {exc}")
 
-            # Sleep the remainder of the poll interval.
-            elapsed = time.monotonic() - cycle_start
-            time.sleep(max(0.0, cfg.poll_interval_seconds - elapsed))
+            # Sleep the remainder of the poll interval in small slices so a
+            # stop request (SIGTERM from the scheduled task) is honoured
+            # promptly instead of after a full poll interval.
+            remaining = max(0.0, cfg.poll_interval_seconds - (time.monotonic() - cycle_start))
+            slept = 0.0
+            while slept < remaining and not stop_flag["stop"]:
+                chunk = min(0.5, remaining - slept)
+                time.sleep(chunk)
+                slept += chunk
     except KeyboardInterrupt:
-        _log("Interrupted; flushing collector buffer and exiting.")
+        _log("Interrupted.")
+    finally:
+        # Flush on EVERY exit path (signal, Ctrl+C, or an escaped error) so
+        # buffered samples are not lost when the scheduled task is stopped.
+        _log("Flushing collector buffer and exiting.")
         try:
             collector.flush_samples(CommandErrorLog())
         except Exception:  # noqa: BLE001
             pass
-        return 0
+    return 0
 
 
 def _run_cycle(

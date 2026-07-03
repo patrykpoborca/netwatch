@@ -15,10 +15,18 @@ Robustness:
   * The same SD-card retention/caps are applied to the incoming directory.
 
 Security:
-  * Optional bearer auth: if ``collector.auth_token`` is set, every endpoint
-    requires ``Authorization: Bearer <token>``; otherwise the server is open and
-    assumes a trusted LAN (documented in the README, with the runbook's privacy
-    note: logs may contain IPs/MACs/DNS queries/hostnames — keep them local).
+  * Bearer auth is on by default. ``collector.auth_token`` resolves as:
+      - non-empty string  -> that token is required on every endpoint;
+      - null (the default) -> a random token is generated once, persisted to
+        ``collector.token_file`` (default ``<output_dir>/collector.token``,
+        mode 0600), and required — so an accidentally exposed collector is
+        never wide open;
+      - false (JSON ``false``) -> auth explicitly disabled: the server is open
+        and trusts the LAN (documented in the README, with the runbook's
+        privacy note: logs may contain IPs/MACs/DNS queries/hostnames — keep
+        them local). A prominent warning is printed at startup.
+    If the token file cannot be created/read (e.g. read-only filesystem), the
+    server degrades to open mode with a warning rather than refusing to start.
 
 ==========================  HTTP CONTRACT  ==================================
 READ:
@@ -40,7 +48,9 @@ INGEST (from Windows desktop):
        Content-Type: application/zip (binary)
          query: ?host_label=...&event_id=...&classification=...
          -> stores the uploaded zip under that event folder, enforcing max size
-Auth (all endpoints, if auth_token set): Authorization: Bearer <token>; else 401.
+Auth (all endpoints, unless auth_token is explicitly false):
+     Authorization: Bearer <token>; else 401. Default (auth_token null) uses an
+     auto-generated token persisted to collector.token_file.
 ============================================================================
 """
 
@@ -50,6 +60,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import tempfile
 import threading
@@ -73,6 +84,12 @@ MAX_ZIP_BODY_BYTES = 64 * 1024 * 1024       # 64 MB per uploaded event zip
 MAX_ZIP_UNCOMPRESSED_BYTES = 256 * 1024 * 1024  # 256 MB
 SAMPLE_TAIL_DEFAULT = 100
 SAMPLE_TAIL_MAX = 5000
+# Cap on how many samples a single /ingest/samples request may carry. The 8 MB
+# JSON body cap alone still admits ~100k tiny samples, each of which costs a
+# per-line appender pass in the request thread — a cheap CPU/IO-exhaustion
+# vector on an open LAN collector. The legitimate Windows client batches ~10
+# samples per push, so this is generous headroom, not a functional limit.
+MAX_SAMPLES_PER_REQUEST = 5000
 # Chunk size used when streaming file/zip responses to avoid buffering
 # multi-MB event archives entirely in memory.
 STREAM_CHUNK_BYTES = 64 * 1024
@@ -146,6 +163,48 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _load_or_create_token(token_file: str) -> Optional[str]:
+    """Return the persisted collector token, generating it on first use.
+
+    The token is stored with mode 0600 so only the service user (root, per the
+    systemd unit) can read it. Returns ``None`` if the file can neither be read
+    nor created (e.g. read-only filesystem) — the caller then degrades to open
+    mode with a warning instead of refusing to start.
+    """
+    try:
+        with open(token_file, "r", encoding="utf-8") as fh:
+            existing = fh.read().strip()
+        if existing:
+            return existing
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None
+    token = secrets.token_hex(16)
+    try:
+        os.makedirs(os.path.dirname(token_file) or ".", exist_ok=True)
+        # O_NOFOLLOW: refuse to write through a symlink planted at the token
+        # path (the collector typically runs as root, so following one could
+        # overwrite an arbitrary system file).
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(token_file, flags, 0o600)
+        # The mode passed to os.open only applies on CREATION; if the file
+        # already existed with looser permissions (e.g. 0644), tighten it so
+        # the token is never left world-readable.
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(token + "\n")
+        return token
+    except OSError:
+        return None
+
+
 class CollectorServer:
     """Owns config + provides the request-handling logic for the HTTP server."""
 
@@ -153,10 +212,44 @@ class CollectorServer:
         self.cfg = cfg
         self.collector_cfg = cfg.collector
         self.incoming_dir = self.collector_cfg["incoming_dir"]
-        self.auth_token = self.collector_cfg.get("auth_token")
         self.jsonl_path = cfg["jsonl_log_path"]
         self.events_dir = cfg.events_dir
         os.makedirs(self.incoming_dir, exist_ok=True)
+
+        # Resolve the effective auth token (see the module docstring):
+        #   non-empty string -> use as-is; null -> auto-generate + persist;
+        #   explicit false/"" -> deliberately open (LAN-trusted).
+        raw_token = self.collector_cfg.get("auth_token")
+        self.token_file: Optional[str] = None
+        if isinstance(raw_token, str) and raw_token:
+            self.auth_token: Optional[str] = raw_token
+            self.auth_mode = "configured"
+        elif raw_token is None:
+            self.token_file = self.collector_cfg.get("token_file") or os.path.join(
+                cfg["output_dir"], "collector.token"
+            )
+            generated = _load_or_create_token(self.token_file)
+            if generated:
+                self.auth_token = generated
+                self.auth_mode = "generated"
+            else:
+                self.auth_token = None
+                self.auth_mode = "open"  # could not persist a token; degrade
+        else:
+            self.auth_token = None
+            self.auth_mode = "open"
+
+    def auth_describe(self) -> str:
+        """One-line, log-friendly description of the effective auth posture."""
+        if self.auth_mode == "configured":
+            return "auth=on (configured token)"
+        if self.auth_mode == "generated":
+            return f"auth=on (auto-generated token; see {self.token_file})"
+        return (
+            "auth=OFF — WARNING: anyone who can reach this port can read all "
+            "collected logs and push data; set collector.auth_token (or leave "
+            "it null to auto-generate) unless this LAN is fully trusted"
+        )
 
     # ---------------------------- auth ----------------------------------- #
     def check_auth(self, header_value: Optional[str]) -> bool:
@@ -343,6 +436,12 @@ class CollectorServer:
 
         if not isinstance(samples, list):
             return 400, {"error": "'samples' must be a list"}
+        if len(samples) > MAX_SAMPLES_PER_REQUEST:
+            # Bound per-request work: without this, one 8 MB body of ~100k tiny
+            # samples pins a handler thread on ~100k appender passes.
+            return 413, {
+                "error": f"too many samples in one request (max {MAX_SAMPLES_PER_REQUEST})"
+            }
 
         written = 0
         per_host: Dict[str, List[str]] = {}
@@ -362,9 +461,9 @@ class CollectorServer:
                 max_bytes=int(self.cfg.log_management["max_jsonl_mb"]) * 1024 * 1024,
                 max_rotated=int(self.cfg.log_management["max_rotated_jsonl_files"]),
             )
-            for line in lines:
-                appender.append(line)
-                written += 1
+            # One lock/open/rotate-check per host batch, not per line.
+            appender.append_many(lines)
+            written += len(lines)
 
         # Enforce the same retention as event ingests: the byte cap alone
         # (as this used to call in isolation) ignores directory/inode
@@ -731,10 +830,9 @@ def build_server(cfg) -> Tuple[ThreadingHTTPServer, CollectorServer]:
 
 def serve_forever(cfg) -> None:
     """Blocking: run the collector HTTP server until interrupted."""
-    httpd, _logic = build_server(cfg)
+    httpd, logic = build_server(cfg)
     addr = httpd.server_address
-    print(f"[collector] listening on {addr[0]}:{addr[1]} "
-          f"(auth={'on' if cfg.collector.get('auth_token') else 'off'})")
+    print(f"[collector] listening on {addr[0]}:{addr[1]} ({logic.auth_describe()})")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -751,7 +849,7 @@ def start_in_thread(cfg) -> Tuple[ThreadingHTTPServer, threading.Thread]:
     in the server cannot take down the watchdog process — it logs and exits the
     thread only.
     """
-    httpd, _logic = build_server(cfg)
+    httpd, logic = build_server(cfg)
 
     def _runner():
         try:
@@ -762,6 +860,5 @@ def start_in_thread(cfg) -> Tuple[ThreadingHTTPServer, threading.Thread]:
     thread = threading.Thread(target=_runner, name="netwatch-collector", daemon=True)
     thread.start()
     addr = httpd.server_address
-    print(f"[collector] background server on {addr[0]}:{addr[1]} "
-          f"(auth={'on' if cfg.collector.get('auth_token') else 'off'})")
+    print(f"[collector] background server on {addr[0]}:{addr[1]} ({logic.auth_describe()})")
     return httpd, thread

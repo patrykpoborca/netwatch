@@ -207,4 +207,20 @@ def load_config(path: Optional[str] = None) -> Config:
             user_cfg = json.load(fh)
 
     merged = _deep_merge(DEFAULT_CONFIG, user_cfg)
+
+    # Restore defaults for explicitly-nulled keys inside the dict sections
+    # (mirrors the Pi side). The section properties already defend a fully
+    # nulled section, but a single nulled LEAF key (e.g.
+    # {"log_management": {"max_jsonl_mb": null}}) survives the merge as None
+    # and crashes consumers that arithmetic on it (JsonlLogger's
+    # int(max_mb * 1024 * 1024)) at startup. Keys whose default is itself
+    # None (e.g. collector.auth_token) keep null as a meaningful value.
+    for section in ("targets", "log_management", "collector"):
+        section_defaults = DEFAULT_CONFIG[section]
+        if not isinstance(merged.get(section), dict):
+            continue  # the section properties return {} for a nulled section
+        for key, default_value in section_defaults.items():
+            if merged[section].get(key) is None and default_value is not None:
+                merged[section][key] = copy.deepcopy(default_value)
+
     return Config(raw=merged)

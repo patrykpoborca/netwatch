@@ -31,7 +31,7 @@ import os
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from . import classify
+from . import classify, pktparse
 from .checks import COUNTER_FILES, read_interface_counters
 from .shellcmd import CommandErrorCollector, have_tool, run_command
 
@@ -264,6 +264,22 @@ def create_snapshot(
         bool(cfg["enable_tcpdump_capture"]),
         collector,
     )
+
+    # --- Optional scapy enrichment of the fresh pcap (best-effort) ---
+    # Mirrors the Windows side's packet_summary step; parse_pcap returns None
+    # (never raises) when scapy is absent or the pcap is empty/corrupt.
+    if pktparse.is_available():
+        try:
+            pkt_summary = pktparse.parse_pcap(
+                os.path.join(folder, "tcpdump_capture.pcap")
+            )
+            if pkt_summary:
+                _write_text(
+                    os.path.join(folder, "packet_summary.json"),
+                    json.dumps(pkt_summary, indent=2),
+                )
+        except Exception as exc:  # enrichment must never block the snapshot
+            collector.errors.append({"command": "pktparse", "error": str(exc)})
 
     # --- recent_samples.jsonl (strip private keys) ---
     _write_recent_samples(folder, recent_samples)

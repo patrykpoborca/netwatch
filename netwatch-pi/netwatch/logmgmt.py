@@ -79,11 +79,25 @@ class JsonlAppender:
 
     def append(self, line: str) -> None:
         """Append a single line (without trailing newline) safely."""
+        self.append_many([line])
+
+    def append_many(self, lines) -> None:
+        """Append many lines under ONE lock/open/rotate-check.
+
+        Used by the collector's sample ingest so a batch of N pushed samples
+        costs one open-append-flush pass instead of N (each ``append`` call
+        re-opens the file and re-stats it for rotation). Rotation is checked
+        once up front; a batch may therefore overshoot ``max_bytes`` by one
+        batch's worth of small lines, which the next write corrects.
+        """
+        if not lines:
+            return
         try:
             with _lock_for(self.path):
                 self._maybe_rotate()
                 with open(self.path, "a", encoding="utf-8") as fh:
-                    fh.write(line + "\n")
+                    for line in lines:
+                        fh.write(line + "\n")
                     fh.flush()  # hand off to OS; no per-line fsync (SD-card friendly)
         except OSError:
             # Never let a logging failure kill the loop.

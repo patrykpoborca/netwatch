@@ -36,7 +36,12 @@ class Watchdog:
         self.last_event_time = 0.0
         self.last_good_gateway_mac: Optional[str] = None
         self.prev_sample: Optional[Dict] = None
-        self.prev_windows_ok: Optional[bool] = None
+        # Latch: True once an event has been captured for the CURRENT
+        # Windows-down episode; cleared when the Windows ping succeeds again.
+        # Without it, a desktop that is merely asleep/off overnight would
+        # re-trigger a full snapshot (including a 60s tcpdump) at every
+        # cooldown expiry — hours of SD-card churn with no new information.
+        self._windows_event_fired = False
         self._stop = False
 
         lm = cfg.log_management
@@ -57,22 +62,11 @@ class Watchdog:
         """Gather, classify, and persist one sample. Returns the sample."""
         sample = checks.gather_sample(self.cfg)
 
-        # Detect a Windows OK->failed transition for the spec's trigger behavior.
-        win_now = sample.get("windows_ping_ok")
-        windows_transition_fail = (
-            self.prev_windows_ok is True and win_now is False
-        )
-
         classification = classify.classify_sample(
             sample,
             prev_sample=self.prev_sample,
             expected_gateway_mac=self.last_good_gateway_mac,
         )
-
-        # If everything is healthy and the Windows ping just transitioned to
-        # failed, escalate to windows_unreachable_from_pi explicitly (the
-        # classifier already does this when win is False, but the transition
-        # guard avoids re-triggering every poll while Windows stays down).
         sample["classification"] = classification
 
         # Write JSONL (without private keys).
@@ -81,19 +75,31 @@ class Watchdog:
         self.recent.append(sample)
 
         # Update rolling state.
-        self._update_state(sample, classification, windows_transition_fail)
+        self._update_state(sample, classification)
         self.prev_sample = sample
-        self.prev_windows_ok = win_now
         return sample
 
-    def _update_state(
-        self, sample: Dict, classification: str, windows_transition_fail: bool
-    ) -> None:
+    def _update_state(self, sample: Dict, classification: str) -> None:
         """Advance the failure counter and trigger snapshots when warranted."""
         # Track last known-good gateway MAC (only while healthy / reachable).
         mac = sample.get("gateway_mac")
         if classification == "healthy" and mac:
             self.last_good_gateway_mac = mac
+
+        # Windows came back: arm the windows_unreachable_from_pi latch again
+        # so the NEXT down-transition captures a fresh event.
+        if sample.get("windows_ping_ok") is True:
+            self._windows_event_fired = False
+
+        # Spec's "Important Trigger Behavior": a Windows-only failure fires ONE
+        # lower-severity event per down-episode (the desktop may simply be off,
+        # asleep, or blocking ICMP). While the latch is set, this state is not
+        # treated as degraded, so it neither re-triggers at every cooldown
+        # expiry nor masks a real Pi-side failure (any other classification
+        # resumes normal counting below).
+        if classification == "windows_unreachable_from_pi" and self._windows_event_fired:
+            self.consecutive_degraded = 0
+            return
 
         if classify.is_degraded(classification):
             self.consecutive_degraded += 1
@@ -112,6 +118,8 @@ class Watchdog:
         if should_trigger:
             self._trigger_event(classification, sample)
             self.last_event_time = now
+            if classification == "windows_unreachable_from_pi":
+                self._windows_event_fired = True
             # Reset so we don't immediately re-trigger; cooldown still applies.
             self.consecutive_degraded = 0
 

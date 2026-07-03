@@ -9,11 +9,12 @@ blocks snapshot creation.
 from __future__ import annotations
 
 import collections
+import os
 from typing import Dict, Optional
 
 # Optional dependency — absence is fine (v1 does not require packet parsing).
 try:  # pragma: no cover - depends on environment
-    from scapy.all import rdpcap  # type: ignore
+    from scapy.all import PcapReader  # type: ignore
     from scapy.layers.l2 import ARP, Ether  # type: ignore
     from scapy.layers.inet import IP, UDP  # type: ignore
 
@@ -21,24 +22,42 @@ try:  # pragma: no cover - depends on environment
 except Exception:  # broad: any import error means "not available"
     _SCAPY_AVAILABLE = False
 
+# Skip parsing captures larger than this outright. tcpdump's window is
+# time-bounded but not size-bounded, and a storm (the very event being
+# snapshotted) can produce a pcap big enough that parsing it would compete
+# with evidence collection for the Pi's limited RAM.
+MAX_PCAP_BYTES = 50 * 1024 * 1024
+
 
 def is_available() -> bool:
     """True if optional packet parsing can run."""
     return _SCAPY_AVAILABLE
 
 
-def parse_pcap(path: str, windows_mac: Optional[str] = None) -> Optional[Dict]:
+def parse_pcap(
+    path: str, windows_mac: Optional[str] = None, max_packets: int = 50000
+) -> Optional[Dict]:
     """Parse ``path`` and return a summary dict, or None if unavailable/failed.
 
     The summary counts total/broadcast/multicast/ARP/DHCP/DNS/mDNS/SSDP frames
     and lists top source MACs / source + destination IPs, plus whether a MAC
     matching the Windows desktop appeared repeatedly.
+
+    ``max_packets`` bounds the per-packet loop (mirroring the Windows side's
+    cap) and ``MAX_PCAP_BYTES`` rejects oversized captures up front. Packets
+    are STREAMED via ``PcapReader`` — never ``rdpcap``, which would load the
+    whole (time- but not size-bounded) capture into the Pi's limited RAM
+    during exactly the high-traffic incident being snapshotted. A
+    truncated/corrupt pcap (including the empty placeholder file written when
+    tcpdump cannot run) fails to open and returns None; corruption mid-file
+    ends the stream early but keeps the partial summary.
     """
     if not _SCAPY_AVAILABLE:
         return None
     try:
-        packets = rdpcap(path)
-    except Exception:
+        if os.path.getsize(path) > MAX_PCAP_BYTES:
+            return None
+    except OSError:
         return None
 
     summary = {
@@ -60,39 +79,52 @@ def parse_pcap(path: str, windows_mac: Optional[str] = None) -> Optional[Dict]:
     dst_ips = collections.Counter()
     win_mac = (windows_mac or "").lower() or None
 
-    for pkt in packets:
-        summary["total_packets"] += 1
-        try:
-            if Ether in pkt:
-                dst = pkt[Ether].dst.lower()
-                src = pkt[Ether].src.lower()
-                src_macs[src] += 1
-                if dst == "ff:ff:ff:ff:ff:ff":
-                    summary["broadcast_frames"] += 1
-                elif int(dst.split(":")[0], 16) & 1:  # multicast bit
-                    summary["multicast_frames"] += 1
-                if win_mac and src == win_mac:
-                    summary["windows_mac_repeats"] += 1
-            if ARP in pkt:
-                summary["arp_count"] += 1
-            if IP in pkt:
-                src_ips[pkt[IP].src] += 1
-                dst_ips[pkt[IP].dst] += 1
-            if UDP in pkt:
-                sport = pkt[UDP].sport
-                dport = pkt[UDP].dport
-                ports = {sport, dport}
-                if ports & {67, 68}:
-                    summary["dhcp_count"] += 1
-                if 53 in ports:
-                    summary["dns_count"] += 1
-                if 5353 in ports:
-                    summary["mdns_count"] += 1
-                if 1900 in ports:
-                    summary["ssdp_count"] += 1
-        except Exception:
-            # Skip malformed frames rather than abort the whole parse.
-            continue
+    seen = 0
+    try:
+        with PcapReader(path) as reader:
+            for pkt in reader:
+                if seen >= max_packets:
+                    summary["truncated_at"] = max_packets
+                    break
+                seen += 1
+                summary["total_packets"] += 1
+                try:
+                    if Ether in pkt:
+                        dst = pkt[Ether].dst.lower()
+                        src = pkt[Ether].src.lower()
+                        src_macs[src] += 1
+                        if dst == "ff:ff:ff:ff:ff:ff":
+                            summary["broadcast_frames"] += 1
+                        elif int(dst.split(":")[0], 16) & 1:  # multicast bit
+                            summary["multicast_frames"] += 1
+                        if win_mac and src == win_mac:
+                            summary["windows_mac_repeats"] += 1
+                    if ARP in pkt:
+                        summary["arp_count"] += 1
+                    if IP in pkt:
+                        src_ips[pkt[IP].src] += 1
+                        dst_ips[pkt[IP].dst] += 1
+                    if UDP in pkt:
+                        sport = pkt[UDP].sport
+                        dport = pkt[UDP].dport
+                        ports = {sport, dport}
+                        if ports & {67, 68}:
+                            summary["dhcp_count"] += 1
+                        if 53 in ports:
+                            summary["dns_count"] += 1
+                        if 5353 in ports:
+                            summary["mdns_count"] += 1
+                        if 1900 in ports:
+                            summary["ssdp_count"] += 1
+                except Exception:
+                    # Skip malformed frames rather than abort the whole parse.
+                    continue
+    except Exception:
+        # Could not open / read the capture at all -> nothing to report.
+        # Mid-stream corruption after some packets keeps the partial summary.
+        if seen == 0:
+            return None
+        summary["parse_error_after"] = seen
 
     summary["top_src_macs"] = src_macs.most_common(10)
     summary["top_src_ips"] = src_ips.most_common(10)

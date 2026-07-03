@@ -13,6 +13,7 @@ Run with:  python -m unittest discover -s netwatch-pi/tests
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -101,12 +102,16 @@ class TestSanitizeLabel(unittest.TestCase):
         self.assertLessEqual(len(_sanitize_label("x" * 500)), 128)
 
 
-def _cfg(tmpdir: str, auth_token=None) -> Config:
+def _cfg(tmpdir: str, auth_token=False) -> Config:
+    """Test config. NOTE: auth_token defaults to False (explicit open mode) so
+    handler-logic tests don't exercise token auto-generation; pass None to test
+    the secure default."""
     raw = default_config_dict()
     raw["output_dir"] = tmpdir
     raw["jsonl_log_path"] = os.path.join(tmpdir, "netwatch-pi.jsonl")
     raw["collector"]["incoming_dir"] = os.path.join(tmpdir, "incoming")
     raw["collector"]["auth_token"] = auth_token
+    raw["collector"]["token_file"] = os.path.join(tmpdir, "collector.token")
     return Config(raw, path=None)
 
 
@@ -117,13 +122,51 @@ class TestCheckAuth(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_open_server_allows_all(self):
-        srv = CollectorServer(_cfg(self._tmp.name, auth_token=None))
+    def test_explicit_false_disables_auth(self):
+        srv = CollectorServer(_cfg(self._tmp.name, auth_token=False))
+        self.assertEqual(srv.auth_mode, "open")
         self.assertTrue(srv.check_auth(None))
         self.assertTrue(srv.check_auth("anything"))
+        self.assertIn("auth=OFF", srv.auth_describe())
+
+    def test_null_default_auto_generates_and_requires_token(self):
+        # The secure default: auth_token null -> generate + persist + require.
+        srv = CollectorServer(_cfg(self._tmp.name, auth_token=None))
+        self.assertEqual(srv.auth_mode, "generated")
+        self.assertTrue(os.path.isfile(srv.token_file))
+        with open(srv.token_file, "r", encoding="utf-8") as fh:
+            token = fh.read().strip()
+        self.assertGreaterEqual(len(token), 32)
+        self.assertFalse(srv.check_auth(None))
+        self.assertFalse(srv.check_auth("Bearer wrong"))
+        self.assertTrue(srv.check_auth(f"Bearer {token}"))
+        # Owner-only permissions on the persisted token.
+        if os.name == "posix":
+            self.assertEqual(os.stat(srv.token_file).st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(os.name == "posix", "posix permissions")
+    def test_preexisting_loose_perms_tightened_on_write(self):
+        # An EMPTY token file left behind with loose permissions must not stay
+        # world-readable once the token is written into it (os.open's mode only
+        # applies on creation; fchmod covers the pre-existing case).
+        cfg = _cfg(self._tmp.name, auth_token=None)
+        token_path = cfg.collector["token_file"]
+        with open(token_path, "w", encoding="utf-8"):
+            pass
+        os.chmod(token_path, 0o644)
+        srv = CollectorServer(cfg)
+        self.assertEqual(srv.auth_mode, "generated")
+        self.assertEqual(os.stat(token_path).st_mode & 0o777, 0o600)
+
+    def test_generated_token_is_stable_across_restarts(self):
+        cfg = _cfg(self._tmp.name, auth_token=None)
+        first = CollectorServer(cfg).auth_token
+        second = CollectorServer(cfg).auth_token
+        self.assertEqual(first, second)
 
     def test_token_required_and_matched(self):
         srv = CollectorServer(_cfg(self._tmp.name, auth_token="s3cret"))
+        self.assertEqual(srv.auth_mode, "configured")
         self.assertFalse(srv.check_auth(None))
         self.assertFalse(srv.check_auth("Bearer wrong"))
         self.assertTrue(srv.check_auth("Bearer s3cret"))
@@ -138,7 +181,7 @@ class TestCheckAuth(unittest.TestCase):
 class TestIngestZip(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.srv = CollectorServer(_cfg(self._tmp.name, auth_token=None))
+        self.srv = CollectorServer(_cfg(self._tmp.name))
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -159,6 +202,49 @@ class TestIngestZip(unittest.TestCase):
             big, {"host_label": ["h"], "event_id": ["e1"]}
         )
         self.assertEqual(status, 413)
+
+
+class TestIngestSamples(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.srv = CollectorServer(_cfg(self._tmp.name))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_batch_written_to_per_host_jsonl(self):
+        body = json.dumps(
+            {"samples": [{"host_label": "win", "v": i} for i in range(25)]}
+        ).encode("utf-8")
+        status, obj = self.srv.ingest_samples(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(obj["written"], 25)
+        path = os.path.join(self.srv.incoming_dir, "win", "samples.jsonl")
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = [json.loads(l) for l in fh if l.strip()]
+        self.assertEqual(len(lines), 25)
+        self.assertEqual(lines[0]["host_label"], "win")
+
+    def test_rejects_over_sample_count_cap(self):
+        # An 8 MB body can carry ~100k tiny samples; the per-request cap must
+        # bound the work a single request can force on the handler thread.
+        n = collector_mod.MAX_SAMPLES_PER_REQUEST + 1
+        body = json.dumps({"samples": [{"v": 1}] * n}).encode("utf-8")
+        status, obj = self.srv.ingest_samples(body)
+        self.assertEqual(status, 413)
+        # Nothing written for the rejected request.
+        self.assertFalse(
+            os.path.isfile(
+                os.path.join(self.srv.incoming_dir, "unknown-host", "samples.jsonl")
+            )
+        )
+
+    def test_cap_boundary_accepted(self):
+        n = collector_mod.MAX_SAMPLES_PER_REQUEST
+        body = json.dumps({"samples": [{"host_label": "win", "v": 1}] * n}).encode("utf-8")
+        status, obj = self.srv.ingest_samples(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(obj["written"], n)
 
 
 if __name__ == "__main__":

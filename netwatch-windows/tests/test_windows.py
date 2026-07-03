@@ -14,6 +14,7 @@ Run with:  python -m unittest discover -s netwatch-windows/tests
 from __future__ import annotations
 
 import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -177,6 +178,59 @@ class TestRunCycleRobustness(unittest.TestCase):
             app._run_prune = orig_prune
 
 
+class TestGracefulShutdownFlush(unittest.TestCase):
+    """SIGTERM (how the scheduled task is stopped) must flush the sample buffer.
+
+    Previously only KeyboardInterrupt flushed, so every service stop dropped up
+    to ``sample_batch_size`` buffered samples.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cfg = _temp_cfg(self._tmp.name)
+        self.cfg.raw["poll_interval_seconds"] = 0
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    @unittest.skipUnless(hasattr(signal, "raise_signal"), "needs signal.raise_signal")
+    def test_sigterm_stops_loop_and_flushes(self):
+        flushed = []
+
+        class StubCollector:
+            enabled = False
+            push_events_enabled = False
+
+            def __init__(self, cfg):
+                pass
+
+            def flush_samples(self, error_log):
+                flushed.append(True)
+
+        orig_collector = app.Collector
+        orig_cycle = app._run_cycle
+        orig_prune = app._run_prune
+        orig_handlers = {
+            sig: signal.getsignal(sig)
+            for sig in (signal.SIGTERM, signal.SIGINT)
+        }
+        app.Collector = StubCollector
+        app._run_prune = lambda cfg: None
+        # The first cycle delivers SIGTERM (what Task Scheduler / taskkill
+        # sends); the loop must exit cleanly and flush exactly once.
+        app._run_cycle = lambda *a, **k: signal.raise_signal(signal.SIGTERM)
+        try:
+            rc = app.cmd_run(self.cfg)
+        finally:
+            app.Collector = orig_collector
+            app._run_cycle = orig_cycle
+            app._run_prune = orig_prune
+            for sig, handler in orig_handlers.items():
+                signal.signal(sig, handler)
+        self.assertEqual(rc, 0)
+        self.assertEqual(flushed, [True])
+
+
 class TestConfigNullSections(unittest.TestCase):
     """A config that explicitly nulls log_management/collector must not crash."""
 
@@ -187,6 +241,22 @@ class TestConfigNullSections(unittest.TestCase):
         self.assertEqual(cfg.log_management, {})
         # The exact call sites cmd_run uses must not raise.
         self.assertEqual(cfg.log_management.get("prune_interval_seconds", 3600), 3600)
+
+    def test_null_leaf_key_restored_by_load_config(self):
+        # A single nulled leaf key must not crash JsonlLogger at startup.
+        import json as _json
+        from netwatch.config import load_config
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "config.json")
+            with open(p, "w", encoding="utf-8") as fh:
+                _json.dump({"log_management": {"max_jsonl_mb": None}}, fh)
+            cfg = load_config(p)
+            self.assertEqual(cfg.log_management["max_jsonl_mb"], 50)
+            # Nullable-by-design key keeps its meaning.
+            with open(p, "w", encoding="utf-8") as fh:
+                _json.dump({"collector": {"auth_token": None}}, fh)
+            cfg = load_config(p)
+            self.assertIsNone(cfg.collector["auth_token"])
 
     def test_null_collector_returns_empty_dict(self):
         raw = default_config_dict()

@@ -59,9 +59,14 @@ DEFAULTS: Dict[str, Any] = {
         "enabled": True,
         "bind_host": "0.0.0.0",
         "bind_port": 8787,
-        # If set, every endpoint requires "Authorization: Bearer <token>".
-        # If null, the server is open and trusts the LAN (documented in README).
+        # Auth for every endpoint ("Authorization: Bearer <token>"):
+        #   string -> that token is required;
+        #   null (default) -> a token is auto-generated once and persisted to
+        #     token_file, so the collector is never accidentally wide open;
+        #   false -> auth explicitly disabled (open, trusted-LAN only).
         "auth_token": None,
+        # Where the auto-generated token is persisted (null -> <output_dir>/collector.token).
+        "token_file": None,
         "incoming_dir": "/var/log/netwatch-pi/incoming",
         # Hard cap on the total size of incoming/ pushed logs to protect the SD card.
         "max_incoming_mb": 500,
@@ -146,6 +151,26 @@ def load_config(path: str | None = None) -> Config:
         user_data = {}
 
     merged = _deep_merge(DEFAULTS, user_data)
+
+    # Normalize the dict-valued sections. A user config that sets e.g.
+    # "log_management": null — or an individual key like
+    # "log_management": {"max_jsonl_mb": null} — survives the deep-merge as
+    # None (the merge only backfills MISSING keys, not explicit nulls), and
+    # consumers index these directly (int(cfg.log_management["max_jsonl_mb"]),
+    # ...), which would crash the watchdog at startup — violating this
+    # module's "never crash on a partial config" contract. Restore defaults
+    # for a nulled section and for nulled keys within it, EXCEPT keys whose
+    # default is itself None (e.g. collector.auth_token / token_file), where
+    # null is a meaningful value.
+    for section in ("targets", "log_management", "collector"):
+        section_defaults = DEFAULTS[section]
+        if not isinstance(merged.get(section), dict):
+            merged[section] = copy.deepcopy(section_defaults)
+            continue
+        for key, default_value in section_defaults.items():
+            if merged[section].get(key) is None and default_value is not None:
+                merged[section][key] = copy.deepcopy(default_value)
+
     return Config(merged, path=resolved)
 
 

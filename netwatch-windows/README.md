@@ -207,7 +207,7 @@ The Pi can act as the central log host. Enable best-effort push in `config.json`
 "collector": {
   "enabled": true,
   "base_url": "http://192.168.4.25:8787",
-  "auth_token": "your-shared-secret-or-null",
+  "auth_token": "your-shared-secret",
   "push_samples": true,
   "push_events": true,
   "timeout_seconds": 3,
@@ -215,6 +215,12 @@ The Pi can act as the central log host. Enable best-effort push in `config.json`
   "max_push_event_mb": 5
 }
 ```
+
+The Pi collector requires a bearer token by default: it auto-generates one on
+first start and persists it on the Pi at `/var/log/netwatch-pi/collector.token`
+(`sudo cat` it and paste the value into `auth_token` above). If the Pi is
+deliberately run open (`"auth_token": false` on the Pi side), leave
+`auth_token` as `null` here.
 
 Pushing is **best-effort and non-blocking**: a short timeout is used, all exceptions are
 swallowed and recorded into `command_errors.json`, and failures never stall or crash
